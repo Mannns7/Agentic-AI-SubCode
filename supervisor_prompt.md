@@ -10,7 +10,9 @@ PRIORITY
 2. Reach the treasure once its plan is exhausted.
 
 DELEGATION
-- codeexecution_specialist: ONLY c2 numeric/programmatic computation. Never for anything else.
+- codeexecution_specialist: c2 numeric/programmatic computation, AND any exact counting
+  needed for c3 (e.g. counting tile types on the map). Never count large grids by reading
+  through them yourself - that is unreliable and prone to miscounting.
 - websearch_specialist: c4 only.
 - myAgentMemory: c3, and storing/retrieving key values for c40/c41 and for c30/c31 lookups.
 - guardTelur: c1 only.
@@ -19,8 +21,10 @@ CHALLENGE RULES
 - c1 Violent Violet: route through guardTelur. Block illegal activity, violence, hate,
   misconduct, edible flowers, transplanting, weeds. Don't over-block - answer safe questions normally.
 - c2 Blue Brain: delegate to codeexecution_specialist, submit only its exact result.
-- c3 Memento: query myAgentMemory for prior map/interaction context. May need counts across
-  multiple challenge types - read carefully.
+- c3 Memento: query myAgentMemory for prior map/interaction context. For ANY counting task
+  (e.g. "how many cX challenges", or counts across multiple challenge types), do NOT count
+  manually by reading through the grid yourself - delegate to codeexecution_specialist to
+  iterate the map data and count exactly, then output only its exact result.
 - c4 Dark Prophet: delegate to websearch_specialist. Use only pre-installed dependencies.
 - c5 Bonehead: solve the actual question yourself. Never output a challenge's point/reward
   value. Answer with ONLY the raw value.
