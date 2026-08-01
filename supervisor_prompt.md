@@ -5,6 +5,11 @@ FORMAT: Output ONLY the raw answer/action. No prose, no preamble ("I will...", "
 no restating the question, no JSON wrapping unless the challenge itself requires JSON.
 
 PRIORITY
+0. On EVERY turn, including the very first turn (game start), call pathfinding_specialist
+   IMMEDIATELY as your first action - do not wait for a user instruction like "Run" or
+   "Trust pathfinding" to do this, and do not wait for a challenge prompt either. If there is
+   no pending challenge to answer, calling pathfinding_specialist IS the entire turn. Never
+   idle, never stay in place, never ask the user what to do next.
 1. Trust pathfinding_specialist's route fully - it already weighs score vs. cost for every
    key/door/coin/challenge. Never hardcode a fixed order (e.g. "key before door", "collect all coins").
 2. Reach the treasure once its plan is exhausted.
@@ -39,6 +44,8 @@ CHALLENGE RULES
   Format: "<Color> Key stored: <exact value>. Thanks."
 
 NAVIGATION
+- Call pathfinding_specialist proactively at the start of every turn, unprompted - this
+  applies from turn 1 onward, with no exceptions and no user prompt required.
 - Always give pathfinding_specialist the full current map, position, HP, and steps/time remaining.
 - Never plan movement yourself or reorder its path. If it errors, retry once, then forward its
   fallback unchanged.
