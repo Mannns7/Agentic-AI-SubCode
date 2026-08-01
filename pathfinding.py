@@ -1,8 +1,12 @@
 import json
 import re
 import heapq
+import logging
 from collections import deque
 from itertools import permutations
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
 DANGER_COST = 1000
 DOOR_COST_LOCKED = 5000
@@ -679,6 +683,24 @@ def plan_path(start, game_map, hp_remaining=5, step_cost=DEFAULT_STEP_COST, visi
     return _path_to_directions(best_seg)
 
 
+def _coerce_number(value, default, field_name=""):
+    """Best-effort convert `value` to a number, falling back to `default`
+    (instead of raising) if it isn't a clean number. This protects
+    against a caller sending a semantically different field under an
+    accepted name - e.g. a countdown-timer string like "4:51" landing in
+    a numeric slot - crashing the WHOLE request into the dumb fallback
+    path instead of just ignoring that one bad field."""
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return value
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        logger.warning(f"Ignoring non-numeric value for {field_name!r}: {value!r}, using default {default}")
+        return default
+
+
 def lambda_handler(event, context):
     try:
         body = json.loads(event["body"]) if "body" in event and isinstance(event["body"], str) else event.get("body", event)
@@ -686,12 +708,25 @@ def lambda_handler(event, context):
         if game_map:
             max_cols = max(len(row) for row in game_map)
             game_map = [row + ["normal"] * (max_cols - len(row)) for row in game_map]
-        start_raw = body.get("start", body.get("position", body.get("agent_position", "A1")))
+        # Accept every field-name variant callers have actually sent so
+        # far, including "start_pos" - a mismatch here silently made every
+        # call plan from the map's default start instead of the agent's
+        # real current position.
+        start_raw = body.get("start", body.get("start_pos", body.get("position",
+                    body.get("current_position", body.get("agent_position", "A1")))))
         start = _parse_start(start_raw)
-        hp = body.get("hp", body.get("health", body.get("life_points", 5)))
-        hp = int(hp) if isinstance(hp, str) else hp
-        step_cost = body.get("step_cost", body.get("time_penalty", DEFAULT_STEP_COST))
-        step_cost = float(step_cost) if isinstance(step_cost, str) else step_cost
+        hp_raw = body.get("hp", body.get("current_hp", body.get("health", body.get("life_points", 5))))
+        hp = _coerce_number(hp_raw, 5, "hp")
+        # step_cost and time_remaining are NOT the same thing (per-move
+        # penalty vs. a countdown timer) and must never be conflated - a
+        # caller accidentally sending a time-remaining value (e.g. the
+        # string "4:51") into step_cost used to crash this whole request
+        # into the generic fallback path. Only genuine step-cost/
+        # time-penalty fields feed step_cost; time_remaining is accepted
+        # but currently informational only (not used as step_cost).
+        step_cost_raw = body.get("step_cost", body.get("time_penalty", DEFAULT_STEP_COST))
+        step_cost = _coerce_number(step_cost_raw, DEFAULT_STEP_COST, "step_cost")
+        _time_remaining = body.get("time_remaining")  # accepted, informational only for now
         # Optional: list of already-collected tile positions (e.g.
         # ["H1", "E10"]), so a stale/unscrubbed map never causes a
         # pointless revisit of a tile that has nothing left to give.
@@ -826,4 +861,35 @@ if __name__ == "__main__":
     assert "c18" not in TILE_SCORES
     assert "c18" not in FORCE_COLLECT_TYPES
 
-    print("OK: all 7 self-checks passed")
+    # Test 8 (NEW): the pathfinding sub-agent prompt sends "start_pos"
+    # (not "start"/"position"/"agent_position") - lambda_handler must
+    # accept that name too, or every call silently plans from the map's
+    # default start instead of the agent's real current position.
+    event_a = {"map": red_map if False else [
+        ["start", "normal", "normal", "normal"],
+        ["c40", "normal", "normal", "normal"],
+        ["normal", "normal", "normal", "normal"],
+        ["normal", "normal", "normal", "c30"],
+        ["normal", "normal", "normal", "treasure"],
+    ], "start_pos": "B1", "hp": 10}
+    resp_a = lambda_handler(event_a, None)
+    body_a = json.loads(resp_a["body"])
+    assert resp_a["statusCode"] == 200 and body_a["directions"], "start_pos must be accepted and produce a real plan"
+
+    # Test 9 (NEW): a non-numeric step_cost (e.g. a "4:51" countdown-timer
+    # string accidentally sent instead of a real step cost) must not
+    # crash the whole request into the dumb hardcoded fallback - it
+    # should fall back to DEFAULT_STEP_COST and still produce a real plan.
+    event_b = {"map": [
+        ["start", "normal", "normal", "normal"],
+        ["c40", "normal", "normal", "normal"],
+        ["normal", "normal", "normal", "normal"],
+        ["normal", "normal", "normal", "c30"],
+        ["normal", "normal", "normal", "treasure"],
+    ], "start": "A1", "hp": 10, "step_cost": "4:51"}
+    resp_b = lambda_handler(event_b, None)
+    body_b = json.loads(resp_b["body"])
+    assert resp_b["statusCode"] == 200 and body_b["directions"] != ["down", "right", "down", "right"], \
+        "a bad non-numeric step_cost must not crash into the generic hardcoded fallback"
+
+    print("OK: all 9 self-checks passed")
