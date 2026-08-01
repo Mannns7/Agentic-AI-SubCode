@@ -703,9 +703,18 @@ def lambda_handler(event, context):
         directions = plan_path(start, game_map, hp_remaining=hp, step_cost=step_cost, visited=visited, held_keys=held_keys)
         if not directions:
             directions = ["down", "right"]
-        return {"statusCode": 200, "body": json.dumps({"directions": directions, "action": directions[0], "path": directions})}
+        # IMPORTANT: only ever return ONE field for the move list, named
+        # "directions". A previous version also included "action":
+        # directions[0] (a single word) and a duplicate "path" field.
+        # That "action" field name reads, to an LLM consuming this tool's
+        # result, as "the thing to output" - causing the agent to reply
+        # with just the first direction (e.g. "left") instead of
+        # forwarding the entire route, which made the game apply only one
+        # move per turn and lose almost immediately. Do not re-add an
+        # "action"/"first_step"/single-value field here.
+        return {"statusCode": 200, "body": json.dumps({"directions": directions})}
     except Exception as e:
-        return {"statusCode": 200, "body": json.dumps({"directions": ["down", "right", "down", "right"], "action": "down", "path": ["down", "right", "down", "right"], "message": f"Fallback mode: {str(e)}"})}
+        return {"statusCode": 200, "body": json.dumps({"directions": ["down", "right", "down", "right"], "message": f"Fallback mode: {str(e)}"})}
 
 
 if __name__ == "__main__":
