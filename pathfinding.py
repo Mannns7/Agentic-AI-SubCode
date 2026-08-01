@@ -93,6 +93,26 @@ def _tile_score(cell_lower):
 
 def _parse_start(pos):
     try:
+        # CRITICAL: every combat log from this game sends the position as
+        # a dict like {"row": 4, "col": 5} - NOT a list/tuple and NOT an
+        # "A1"-style string. Before this branch existed, a dict fell
+        # through to the generic str(pos) parsing below, which mangled
+        # "{'row': 4, 'col': 5}" into garbage coordinates (e.g. it could
+        # match the 'w' in "row" as a column letter), silently placing the
+        # agent on a WRONG starting tile - explaining "walks into a wall
+        # immediately at game start" even though the map/grid logic itself
+        # was correct. Handle dicts FIRST and explicitly, with several key
+        # name variants seen across different payload shapes.
+        if isinstance(pos, dict):
+            row = pos.get("row", pos.get("r", pos.get("y")))
+            col = pos.get("col", pos.get("column", pos.get("c", pos.get("x"))))
+            if row is not None and col is not None:
+                return (int(row), int(col))
+            # dict didn't have row/col-style keys - try any two numeric values
+            vals = [v for v in pos.values() if isinstance(v, (int, float)) or
+                    (isinstance(v, str) and re.fullmatch(r"-?\d+", v))]
+            if len(vals) >= 2:
+                return (int(vals[0]), int(vals[1]))
         if isinstance(pos, (list, tuple)):
             if len(pos) == 1:
                 return _parse_start(pos[0])
@@ -892,4 +912,26 @@ if __name__ == "__main__":
     assert resp_b["statusCode"] == 200 and body_b["directions"] != ["down", "right", "down", "right"], \
         "a bad non-numeric step_cost must not crash into the generic hardcoded fallback"
 
-    print("OK: all 9 self-checks passed")
+    # Test 10 (NEW - critical): every combat log from this game sends the
+    # start/current position as {"row": R, "col": C}, not a list/tuple or
+    # "A1" string. Before the dict branch was added, this silently
+    # produced garbage coordinates (parsing the literal string
+    # "{'row': 4, 'col': 5}"), placing the agent on the wrong tile and
+    # causing it to walk into a wall immediately at game start.
+    assert _parse_start({"row": 4, "col": 5}) == (4, 5)
+    assert _parse_start({"col": 5, "row": 4}) == (4, 5), "key order must not matter"
+    assert _parse_start({"r": 2, "c": 3}) == (2, 3)
+    assert _parse_start({"x": 3, "y": 2}) == (2, 3), "x/y style: y is row, x is col"
+
+    dict_pos_map = [
+        ["start", "normal", "normal"],
+        ["normal", "c1", "normal"],
+        ["normal", "normal", "treasure"],
+    ]
+    event_c = {"map": dict_pos_map, "start": {"row": 0, "col": 0}, "hp": 10}
+    resp_c = lambda_handler(event_c, None)
+    body_c = json.loads(resp_c["body"])
+    assert resp_c["statusCode"] == 200 and body_c["directions"], \
+        "lambda_handler must correctly plan from a dict-shaped {row, col} start position"
+
+    print("OK: all 10 self-checks passed")
