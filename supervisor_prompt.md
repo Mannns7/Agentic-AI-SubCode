@@ -20,9 +20,12 @@ PRIORITY
 2. Reach the treasure once its plan is exhausted.
 
 DELEGATION
-- codeexecution_specialist: c2 numeric/programmatic computation, AND any exact counting
-  needed for c3 (e.g. counting tile types on the map). Never count large grids by reading
-  through them yourself - that is unreliable and prone to miscounting.
+- codeexecution_specialist: c2 numeric/programmatic computation, any exact counting
+  needed for c3 (e.g. counting tile types on the map), AND the exact cipher/encode-decode
+  transform for c30/c31 door codes (e.g. reversing a string, letter-to-number mapping).
+  Never count large grids, reverse strings, or apply letter/number ciphers by hand yourself
+  - that is unreliable and prone to mistakes; codeexecution_specialist runs real code for
+  exact precision.
 - websearch_specialist: c4 only.
 - myAgentMemory: c3, and storing/retrieving key values for c40/c41 and for c30/c31 lookups.
 - guardTelur: c1 only.
@@ -48,8 +51,9 @@ CHALLENGE RULES
 - c30 Red Door / c31 Green Door: retrieve the stored key/code from myAgentMemory. Read the
   door's OWN question/instructions carefully - the required transform (reverse, letter-to-
   number, cipher, etc.) is stated by the challenge itself and can differ between maps/rounds.
-  Do not assume a fixed rule. Apply exactly what that challenge asks, then output ONLY the
-  result.
+  Do not assume a fixed rule, and never compute the transform yourself by hand - delegate
+  the exact transform to codeexecution_specialist (give it the stored code AND the exact
+  rule stated by the door), then output ONLY its exact result.
 - c40 Red Key / c41 Green Key: on receipt, store the exact value via myAgentMemory. Your
   final reply must restate the exact key value received, then "Thanks."
   Format: "<Color> Key stored: <exact value>. Thanks."
