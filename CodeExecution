@@ -1,0 +1,246 @@
+import json
+import io
+import ast
+import math
+import signal
+import contextlib
+
+# --- SAFETY: restricted execution environment ---
+# Only expose a curated, safe subset of builtins and modules. No file I/O,
+# no network, no process/OS access, no dynamic import of arbitrary modules.
+SAFE_BUILTINS = {
+    "abs": abs, "all": all, "any": any, "bin": bin, "bool": bool,
+    "chr": chr, "dict": dict, "divmod": divmod, "enumerate": enumerate,
+    "filter": filter, "float": float, "format": format, "frozenset": frozenset,
+    "hex": hex, "int": int, "isinstance": isinstance, "len": len,
+    "list": list, "map": map, "max": max, "min": min, "oct": oct,
+    "ord": ord, "pow": pow, "print": print, "range": range,
+    "repr": repr, "reversed": reversed, "round": round, "set": set,
+    "sorted": sorted, "str": str, "sum": sum, "tuple": tuple, "zip": zip,
+    "True": True, "False": False, "None": None,
+}
+
+SAFE_MODULES = {
+    "math": math,
+    "itertools": __import__("itertools"),
+    "functools": __import__("functools"),
+    "collections": __import__("collections"),
+    "re": __import__("re"),
+    "decimal": __import__("decimal"),
+    "fractions": __import__("fractions"),
+    "string": __import__("string"),  # e.g. string.ascii_uppercase — handy for
+                                      # cipher/alphabet challenges (c30/c31 doors)
+}
+
+EXEC_TIMEOUT_SECONDS = 10
+
+
+class _TimeoutError(Exception):
+    pass
+
+
+def _timeout_handler(signum, frame):
+    raise _TimeoutError(f"Code execution exceeded {EXEC_TIMEOUT_SECONDS}s — likely an infinite loop.")
+
+
+def _restricted_import(name, *args, **kwargs):
+    if name in SAFE_MODULES:
+        return SAFE_MODULES[name]
+    raise ImportError(f"Import of '{name}' is not permitted in this sandbox. "
+                       f"Allowed: {', '.join(sorted(SAFE_MODULES))}")
+
+
+def _build_safe_globals():
+    safe_builtins = dict(SAFE_BUILTINS)
+    safe_builtins["__import__"] = _restricted_import
+    return {"__builtins__": safe_builtins, **SAFE_MODULES}
+
+
+def execute_code(code, timeout_seconds=EXEC_TIMEOUT_SECONDS):
+    """
+    Execute a snippet of Python code in a restricted sandbox and return:
+      { "stdout": <captured print output>,
+        "result": <value of a `result = ...` variable if set, else the
+                   value of the last top-level expression, if any>,
+        "error": <None or an error message> }
+
+    Any code that references disallowed names (open, os, sys, subprocess,
+    eval, exec, __import__ of unlisted modules, etc.) will raise a
+    NameError/ImportError rather than execute, since they simply aren't in
+    the restricted global namespace.
+    """
+    global EXEC_TIMEOUT_SECONDS
+    EXEC_TIMEOUT_SECONDS = timeout_seconds
+
+    stdout_buffer = io.StringIO()
+    safe_globals = _build_safe_globals()
+    safe_locals = {}
+
+    try:
+        tree = ast.parse(code, mode="exec")
+    except SyntaxError as e:
+        return {"stdout": "", "result": None, "error": f"SyntaxError: {e}"}
+
+    # If the last top-level statement is a bare expression, capture its
+    # value automatically (REPL-style), like Jupyter/Code Interpreter does.
+    last_expr = None
+    if tree.body and isinstance(tree.body[-1], ast.Expr):
+        last_expr = tree.body.pop()
+
+    old_handler = None
+    try:
+        old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+        signal.alarm(timeout_seconds)
+
+        with contextlib.redirect_stdout(stdout_buffer):
+            exec(compile(tree, "<sandbox>", "exec"), safe_globals, safe_locals)
+            last_value = None
+            if last_expr is not None:
+                last_value = eval(compile(ast.Expression(last_expr.value), "<sandbox>", "eval"),
+                                   safe_globals, safe_locals)
+
+        signal.alarm(0)
+
+        result = safe_locals.get("result", last_value)
+        return {"stdout": stdout_buffer.getvalue(), "result": _jsonable(result), "error": None}
+
+    except _TimeoutError as e:
+        return {"stdout": stdout_buffer.getvalue(), "result": None, "error": str(e)}
+    except Exception as e:
+        return {"stdout": stdout_buffer.getvalue(), "result": None, "error": f"{type(e).__name__}: {e}"}
+    finally:
+        signal.alarm(0)
+        if old_handler is not None:
+            signal.signal(signal.SIGALRM, old_handler)
+
+
+def _jsonable(value):
+    """Make the result JSON-safe. Big ints stay exact via str(); anything
+    else that can't be serialized falls back to repr()."""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        if isinstance(value, int) and not isinstance(value, bool) and abs(value) > 10**15:
+            return str(value)  # preserve exact precision for huge integers
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(v) for v in value]
+    if isinstance(value, dict):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    try:
+        json.dumps(value)
+        return value
+    except TypeError:
+        return repr(value)
+
+
+def lambda_handler(event, context):
+    """
+    Generic, sandboxed Python code executor. The AGENT writes the code for
+    whatever the current challenge needs; this Lambda just runs it safely
+    and returns stdout/result. It does not special-case any tile type —
+    it's a general computation tool. Below are the challenge types (from
+    the game guide) that this tool is meant to be delegated to, since
+    they're exactly the kind of thing an LLM can't reliably compute on its
+    own and needs real code execution for. Same map/mechanics for both the
+    practice and tournament rounds, so the same code patterns apply:
+
+    - c2  Blue Brain (code challenge): any exact large-number computation,
+      e.g. "Tell me the 3000th Fibonacci number, last 10 digits":
+          def fib(n):
+              a, b = 0, 1
+              for _ in range(n):
+                  a, b = b, a + b
+              return a
+          result = str(fib(3000))[-10:]
+
+    - c30 Red Door: cipher is "read the received code backwards".
+          result = given_code[::-1]
+
+    - c31 Green Door: cipher is "replace each letter with the number
+      representing its position in the alphabet (A=1, B=2, ... Z=26)".
+          result = "-".join(str(ord(ch.upper()) - ord('A') + 1)
+                             for ch in given_code if ch.isalpha())
+      (Adjust the join/format to match whatever the game literally asks
+      for — join with spaces, dashes, or no separator as specified.)
+
+    Body params:
+      code: string — Python code to execute (required)
+      timeout_seconds: int — optional override, default 10, capped at 25
+                        (stay under typical Lambda timeout with margin)
+    """
+    try:
+        body = json.loads(event["body"]) if "body" in event and isinstance(event["body"], str) else event.get("body", event)
+        code = body.get("code")
+        if not code or not isinstance(code, str):
+            return _err("Missing required 'code' string parameter.")
+
+        timeout_seconds = min(int(body.get("timeout_seconds", EXEC_TIMEOUT_SECONDS)), 25)
+        result = execute_code(code, timeout_seconds=timeout_seconds)
+        return {"statusCode": 200, "body": json.dumps(result)}
+
+    except Exception as e:
+        return _err(f"Fallback mode: {e}")
+
+
+def _err(message):
+    return {"statusCode": 200, "body": json.dumps({"stdout": "", "result": None, "error": message})}
+
+
+if __name__ == "__main__":
+    # Self-checks
+    r = execute_code("print(2 + 2)")
+    assert r["stdout"].strip() == "4", r
+    assert r["error"] is None
+
+    r = execute_code("result = 4 ** 10")
+    assert r["result"] == 1048576, r
+
+    r = execute_code("2 + 2")  # bare expression, REPL-style capture
+    assert r["result"] == 4, r
+
+    # Big-integer exactness (this is exactly the c2/Fibonacci use case —
+    # LLMs can't do this reliably, but a real interpreter always can)
+    r = execute_code("""
+def fib(n):
+    a, b = 0, 1
+    for _ in range(n):
+        a, b = b, a + b
+    return a
+result = fib(3000)
+""")
+    assert len(str(r["result"])) == 627, r
+    assert str(r["result"])[-10:] == "6709796000", r
+
+    # Safety: dangerous operations must be blocked
+    r = execute_code("import os\nos.system('echo hacked')")
+    assert r["error"] is not None and "os" in r["error"], r
+
+    r = execute_code("open('/etc/passwd').read()")
+    assert r["error"] is not None, r
+
+    r = execute_code("eval('1+1')")
+    assert r["error"] is not None, r  # eval isn't in SAFE_BUILTINS
+
+    # Infinite loop must be caught by the timeout, not hang forever
+    r = execute_code("while True:\n    pass", timeout_seconds=2)
+    assert r["error"] is not None and "exceeded" in r["error"], r
+
+    # Allowed safe modules work
+    r = execute_code("import math\nresult = math.factorial(10)")
+    assert r["result"] == 3628800, r
+
+    r = execute_code("import string\nresult = string.ascii_uppercase")
+    assert r["result"] == "ABCDEFGHIJKLMNOPQRSTUVWXYZ", r
+
+    # c30 Red Door: "translate the code by reading it backwards"
+    r = execute_code("code = 'open'\nresult = code[::-1]")
+    assert r["result"] == "nepo", r
+
+    # c31 Green Door: "replace letters with the numbers that represent
+    # them in order" (A=1, B=2, ... Z=26)
+    r = execute_code("""
+code = 'open'
+result = "-".join(str(ord(ch.upper()) - ord('A') + 1) for ch in code if ch.isalpha())
+""")
+    assert r["result"] == "15-16-5-14", r  # o=15, p=16, e=5, n=14
+
+    print("OK: all self-checks passed")
