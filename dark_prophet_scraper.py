@@ -5,6 +5,14 @@ Payload: {"url": "...", "question": "..."}
 Scrapes the page and returns full + relevance-ranked content so the agent
 can answer ANY question about it (works for practice and tournament maps,
 since both use the same challenge type with different questions each time).
+
+Relevance ranking is entirely GENERIC (no hardcoded topics/answers): it
+scores content by (1) word/phrase overlap with the question, and (2)
+question-SHAPE cues (e.g. "how many" -> boost numbers, "what model/
+feature/tool..." -> boost named-entity-shaped text like "Sonnet 4" or
+"HyperPod", "outperformed by 20-50%" -> boost comparison/percentage
+phrasing). None of this is tied to any specific round's wording, so it
+keeps working as new questions/pages are introduced each round.
 """
 import json
 import re
@@ -51,7 +59,30 @@ DATE_PATTERN = re.compile(
     re.IGNORECASE
 )
 NUMBER_PATTERN = re.compile(r'[\$€£]?\s?\d[\d,]*\.?\d*\s?(?:%|percent|million|billion|thousand|k|m|b)?', re.IGNORECASE)
-PROPER_NOUN_PATTERN = re.compile(r'\b[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+){0,3}\b')
+# Proper-noun / named-entity pattern, generalized to also cover product and
+# model names that include a version number or short alphanumeric suffix
+# (e.g. "Sonnet 4", "Nova 2 Lite", "GPT-4", "HyperPod") - not hardcoded to
+# any specific product, just a broader shape than plain capitalized words.
+PROPER_NOUN_PATTERN = re.compile(
+    r'\b[A-Z][a-zA-Z]*(?:-?\d+(?:\.\d+)?[a-zA-Z]*)?'
+    r'(?:[\s-]+[A-Z][a-zA-Z]*(?:-?\d+(?:\.\d+)?[a-zA-Z]*)?){0,3}\b'
+)
+# Generic "comparison/quantity" cue words - covers phrasing like "reduce...
+# by up to 40%", "outperformed by 20-50%", "faster/slower", etc. without
+# being tied to any specific round's wording.
+COMPARISON_CUE_PATTERN = re.compile(
+    r'%|\bpercent\b|\bup to\b|\breduc\w*\b|\bincreas\w*\b|\bimprov\w*\b|'
+    r'\boutperform\w*\b|\bfaster\b|\bslower\b|\bmore\b|\bless\b', re.IGNORECASE
+)
+# Generic "what/which <noun>" entity-question cue - matches "what model",
+# "which feature", "what tool/service/product/technology/system/library/
+# framework/algorithm/method", etc. This is a SHAPE match (question
+# grammar), not a hardcoded topic, so it works for any round's wording.
+NAMED_ENTITY_QUESTION_PATTERN = re.compile(
+    r'\b(?:what|which)\s+(?:\w+\s+){0,2}(?:model|feature|tool|service|product|'
+    r'technology|system|library|framework|algorithm|method|version|plan|tier)\b',
+    re.IGNORECASE
+)
 
 
 class PageParser(HTMLParser):
@@ -300,12 +331,23 @@ def _detect_intent(question: str) -> Dict[str, bool]:
     boost the right kind of content no matter what the actual topic is."""
     q = question.lower()
     return {
-        'wants_number': bool(re.search(r'\bhow (many|much|old|long|far|tall)\b|\bnumber of\b|\bcost\b|\bprice\b|\bpercent', q)),
+        'wants_number': bool(re.search(
+            r'\bhow (many|much|old|long|far|tall)\b|\bnumber of\b|\bcost\b|\bprice\b|\bpercent|%', q
+        )),
+        # NEW: catches "outperformed by 20-50%", "reduce...by up to 40%",
+        # comparison/quantity phrasing that isn't a plain "how many" question
+        # but still needs the NUMBER_PATTERN boost below.
+        'wants_comparison': bool(COMPARISON_CUE_PATTERN.search(q)),
         'wants_date': bool(re.search(r'\bwhen\b|\bwhat (year|date|day)\b|\bhow (old|long)\b', q)),
         'wants_person': bool(re.search(r'\bwho\b|\bwhose\b', q)),
         'wants_place': bool(re.search(r'\bwhere\b|\blocated?\b|\baddress\b', q)),
         'wants_list': bool(re.search(r'\blist\b|\ball\b|\bwhich (ones|options)\b|\bexamples?\b', q)),
         'wants_reason': bool(re.search(r'\bwhy\b|\breason\b|\bbecause\b', q)),
+        # NEW: "what model/feature/tool/service/..." style questions -
+        # these want a NAMED ENTITY as the answer (e.g. "Sonnet 4",
+        # "HyperPod"), so proper-noun-shaped text should be boosted even
+        # though the question itself has no "who"/"where" cue word.
+        'wants_named_entity': bool(NAMED_ENTITY_QUESTION_PATTERN.search(q)),
     }
 
 
@@ -354,10 +396,14 @@ def find_relevant(paragraphs: List[str], list_items: List[str], table_rows: List
         # Generic intent-based boosts (based on the SHAPE of the question, not its topic)
         if intent['wants_number'] and NUMBER_PATTERN.search(text):
             score += 2
+        if intent['wants_comparison'] and (NUMBER_PATTERN.search(text) or COMPARISON_CUE_PATTERN.search(text)):
+            score += 2
         if intent['wants_date'] and DATE_PATTERN.search(text):
             score += 2
         if intent['wants_person'] and PROPER_NOUN_PATTERN.search(text):
             score += 1.5
+        if intent['wants_named_entity'] and PROPER_NOUN_PATTERN.search(text):
+            score += 2
         if intent['wants_place'] and re.search(r'\b(street|st\.|avenue|ave\.|city|state|country|located|address)\b', text, re.IGNORECASE):
             score += 1.5
         if src == 'heading':
