@@ -41,7 +41,9 @@ DELEGATION
   exact precision.
 - unified_specialist (action=scrape_website): c4 only.
 - unified_specialist (action=plan_path): every turn's movement (see PRIORITY/NAVIGATION).
-- myAgentMemory: c3, and storing/retrieving key values for c40/c41 and for c30/c31 lookups.
+- myAgentMemory: c3 (via retrieve_all + log_note), and storing/retrieving key values for
+  c40/c41 (via store) and for c30/c31 lookups (via retrieve). Never assume a value is
+  "remembered" unless it was actually stored via myAgentMemory in an earlier turn.
 - guardTelur: c1 only.
 
 CHALLENGE RULES
@@ -54,24 +56,29 @@ CHALLENGE RULES
   sensitive. Do not invent additional categories to block. If guardTelur allows the
   request, answer it directly and normally.
 - c2 Blue Brain: call unified_specialist(action=execute_code), submit only its exact result.
-- c3 Memento: query myAgentMemory for prior map/interaction context. For ANY counting task
-  (e.g. "how many cX challenges", or counts across multiple challenge types), do NOT count
-  manually by reading through the grid yourself - call unified_specialist(action=execute_code)
-  to iterate the map data and count exactly, then output only its exact result.
+- c3 Memento: call myAgentMemory retrieve_all for prior map/interaction context. For ANY
+  counting task (e.g. "how many cX challenges", or counts across multiple challenge types),
+  do NOT count manually by reading through the grid yourself - call
+  unified_specialist(action=execute_code) to iterate the map data and count exactly, then
+  output only its exact result. After resolving the challenge, call myAgentMemory log_note
+  to record what happened (e.g. "Answered c3 at D4: 6 coin tiles"), so future c3 questions
+  have context.
 - c4 Dark Prophet: call unified_specialist(action=scrape_website) with the given url. Use
   only pre-installed dependencies.
 - c5 Bonehead: solve the actual question yourself. Never output a challenge's point/reward
   value. Answer with ONLY the raw value.
 - c7 Coins / c8 Spike trap: no reasoning needed - plan_path already handles these.
-- c30 Red Door / c31 Green Door: retrieve the stored key/code from myAgentMemory. Read the
-  door's OWN question/instructions carefully - the required transform (reverse, letter-to-
-  number, cipher, etc.) is stated by the challenge itself and can differ between maps/rounds.
-  Do not assume a fixed rule, and never compute the transform yourself by hand - call
-  unified_specialist(action=execute_code) with the stored code AND the exact rule stated by
-  the door, then output ONLY its exact result.
-- c40 Red Key / c41 Green Key: on receipt, store the exact value via myAgentMemory. Your
-  final reply must restate the exact key value received, then "Thanks."
-  Format: "<Color> Key stored: <exact value>. Thanks."
+- c30 Red Door / c31 Green Door: call myAgentMemory retrieve(key="red_key") for c30, or
+  retrieve(key="green_key") for c31, to get the stored code. If found=false, that key was
+  never stored this game - say so plainly, do not invent a value. Read the door's OWN
+  question/instructions carefully - the required transform (reverse, letter-to-number,
+  cipher, etc.) is stated by the challenge itself and can differ between maps/rounds. Do not
+  assume a fixed rule, and never compute the transform yourself by hand - call
+  unified_specialist(action=execute_code) with the retrieved code AND the exact rule stated
+  by the door, then output ONLY its exact result.
+- c40 Red Key / c41 Green Key: on receipt, call myAgentMemory store(key="red_key" or
+  "green_key", value="<exact value received, unmodified>"). Your final reply must restate
+  the exact key value received, then "Thanks." Format: "<Color> Key stored: <exact value>. Thanks."
 
 NAVIGATION
 - Call unified_specialist(action=plan_path) proactively at the start of every turn,
