@@ -2,7 +2,8 @@
 Unified Specialist Lambda
 ==========================
 Combines THREE previously-separate sub-agent tools into ONE Lambda /
-ONE tool, dispatched by an "action" field in the request body:
+ONE tool, dispatched by an "action" (execute_code / scrape_website /
+plan_path):
 
   action="execute_code"    -> restricted, sandboxed Python code execution
                                (was: CodeExecution)
@@ -11,22 +12,64 @@ ONE tool, dispatched by an "action" field in the request body:
   action="plan_path"       -> dungeon-map pathfinding / route optimizer
                                (was: pathfinding.py)
 
-Each action's request/response SHAPE is preserved EXACTLY as the
-original standalone Lambda produced, so any existing prompt/agent logic
-that already parses those responses keeps working unchanged - only the
-entry point and file are unified.
+Each action's INTERNAL LOGIC is preserved EXACTLY as the original
+standalone Lambda produced it - only the transport/dispatch layer
+(lambda_handler) is unified and, critically, FIXED to speak the actual
+wire format Amazon Bedrock Agents uses when it invokes an action-group
+Lambda as a tool.
 
-If "action" is omitted, the handler auto-detects it from which fields
-are present in the body (url -> scrape_website, code -> execute_code,
-map/game_map/grid/start/start_pos -> plan_path), for backward
-compatibility with callers that used to hit three separate Lambdas and
-therefore never had to send an action name.
+--------------------------------------------------------------------
+WHY THIS FIX WAS NEEDED (root cause of "technical issue with the
+pathfinding specialist" / repeated retries / lost game):
+--------------------------------------------------------------------
+A Bedrock Agent action group does NOT send/expect a plain API-Gateway
+style event (`{"body": "...json..."}` in / `{"statusCode":200,"body":
+"..."}` out). It sends ONE of two real shapes, and requires a response
+in the MATCHING shape - see AWS docs "Configure Lambda functions for
+action groups in Amazon Bedrock Agents":
+https://docs.aws.amazon.com/bedrock/latest/userguide/agents-lambda.html
+
+1. Function-details schema (what a tool named "...___unified_specialist"
+   in the combat log indicates is in use here):
+     IN:  {"messageVersion": "1.0", "actionGroup": "...",
+           "function": "execute_code",
+           "parameters": [{"name": "code", "type": "string", "value": "..."}],
+           "sessionAttributes": {...}, "promptSessionAttributes": {...}}
+     OUT: {"messageVersion": "1.0",
+           "response": {"actionGroup": "...", "function": "execute_code",
+                         "functionResponse": {"responseBody": {"TEXT": {"body": "<json>"}}}},
+           "sessionAttributes": {...}, "promptSessionAttributes": {...}}
+
+2. OpenAPI schema:
+     IN:  {"messageVersion": "1.0", "actionGroup": "...",
+           "apiPath": "/execute_code", "httpMethod": "POST",
+           "requestBody": {"content": {"application/json": {"properties": [...]}}}}
+     OUT: {"messageVersion": "1.0",
+           "response": {"actionGroup": "...", "apiPath": "...", "httpMethod": "...",
+                         "httpStatusCode": 200,
+                         "responseBody": {"application/json": {"body": "<json>"}}}}
+
+The previous version of this Lambda (and the original 3 separate
+Lambdas before it) only spoke a THIRD, unrelated shape
+(`{"statusCode":200,"body":"..."}`), which Bedrock's agent runtime does
+not recognize as a valid tool result. Every call looked like a failure
+to the orchestrator -> it retried -> still got a shape it couldn't
+parse -> gave up and fell back to the model guessing a "manual
+solution" in plain text, which is exactly what produced the lost game
+in the combat log (0 coins collected, wrong path, game over).
+
+This file auto-detects which of the 3 shapes the incoming `event` is in
+(function-schema / OpenAPI-schema / plain-body, e.g. for local testing
+or a raw Lambda-console test event) and replies in that SAME shape, so
+it works correctly no matter which schema type the action group was
+configured with - without needing any AWS console/IaC change for this
+fix beyond pointing the Lambda handler at this file.
 
 Deploying this file:
 - Point ONE Lambda function's handler at unified_specialist.lambda_handler.
-- Register ONE tool/action-group ("unified_specialist") in place of the
-  three old ones (codeexecution_specialist, pathfinding_specialist,
-  websearch_specialist), with an "action" parameter as described above.
+- Register ONE action group ("unified_specialist") with THREE functions
+  (or 3 apiPaths) named exactly: execute_code, scrape_website, plan_path
+  - in place of the three old separate specialists.
 """
 
 import ast
@@ -177,12 +220,14 @@ def _code_jsonable(value):
         return repr(value)
 
 
-def _handle_execute_code(body):
+def _run_execute_code(body):
     """
     Body params:
       code: string — Python code to execute (required)
       timeout_seconds: int — optional override, default 10, capped at 25
                         (stay under typical Lambda timeout with margin)
+
+    Returns (result_dict, http_status_code).
 
     Challenge types (from the game guide) meant to be delegated here:
 
@@ -208,17 +253,18 @@ def _handle_execute_code(body):
     try:
         code = body.get("code")
         if not code or not isinstance(code, str):
-            return _code_err("Missing required 'code' string parameter.")
+            return {"stdout": "", "result": None, "error": "Missing required 'code' string parameter."}, 200
 
-        timeout_seconds = min(int(body.get("timeout_seconds", CODE_EXEC_TIMEOUT_SECONDS)), 25)
+        timeout_raw = body.get("timeout_seconds", CODE_EXEC_TIMEOUT_SECONDS)
+        try:
+            timeout_seconds = min(int(timeout_raw), 25)
+        except (TypeError, ValueError):
+            timeout_seconds = CODE_EXEC_TIMEOUT_SECONDS
+
         result = execute_code(code, timeout_seconds=timeout_seconds)
-        return {"statusCode": 200, "body": json.dumps(result)}
+        return result, 200
     except Exception as e:
-        return _code_err(f"Fallback mode: {e}")
-
-
-def _code_err(message):
-    return {"statusCode": 200, "body": json.dumps({"stdout": "", "result": None, "error": message})}
+        return {"stdout": "", "result": None, "error": f"Fallback mode: {e}"}, 200
 
 
 # ============================================================================
@@ -253,20 +299,23 @@ class CleanHTMLParser(HTMLParser):
         return "\n".join(self.text_parts)
 
 
-def _handle_scrape_website(body):
+def _run_scrape_website(body):
     """
     Body params:
       url: string — required
       max_length: int — optional, default 4000
+
+    Returns (result_dict, http_status_code).
     """
     url = body.get("url")
     max_length = body.get("max_length", 4000)
+    try:
+        max_length = int(max_length)
+    except (TypeError, ValueError):
+        max_length = 4000
 
     if not url:
-        return {
-            "statusCode": 400,
-            "body": json.dumps({"error": "Missing required parameter 'url'."})
-        }
+        return {"error": "Missing required parameter 'url'."}, 400
 
     # Browser user-agent header to reduce basic blocking
     headers = {
@@ -292,23 +341,14 @@ def _handle_scrape_website(body):
         final_text = clean_text[:max_length]
 
         return {
-            "statusCode": 200,
-            "body": json.dumps({
-                "url": url,
-                "content": final_text,
-                "truncated": is_truncated,
-                "char_count": len(final_text)
-            })
-        }
+            "url": url,
+            "content": final_text,
+            "truncated": is_truncated,
+            "char_count": len(final_text),
+        }, 200
 
     except Exception as e:
-        return {
-            "statusCode": 500,
-            "body": json.dumps({
-                "url": url,
-                "error": f"Failed to scrape website: {str(e)}"
-            })
-        }
+        return {"url": url, "error": f"Failed to scrape website: {str(e)}"}, 500
 
 
 # ============================================================================
@@ -928,7 +968,8 @@ def _coerce_number(value, default, field_name=""):
         return default
 
 
-def _handle_plan_path(body):
+def _run_plan_path(body):
+    """Returns (result_dict, http_status_code)."""
     try:
         game_map = body.get("map", body.get("game_map", body.get("grid", [])))
         if game_map:
@@ -943,7 +984,8 @@ def _handle_plan_path(body):
         step_cost = _coerce_number(step_cost_raw, DEFAULT_STEP_COST, "step_cost")
         _time_remaining = body.get("time_remaining")  # accepted, informational only for now
         visited = body.get("visited", body.get("collected", None))
-        held_keys = frozenset(c.lower() for c in body.get("held_keys", body.get("keys_held", [])) or [])
+        held_keys_raw = body.get("held_keys", body.get("keys_held", [])) or []
+        held_keys = frozenset(c.lower() for c in held_keys_raw)
         directions = plan_path(start, game_map, hp_remaining=hp, step_cost=step_cost, visited=visited, held_keys=held_keys)
         if not directions:
             directions = ["down", "right"]
@@ -951,13 +993,13 @@ def _handle_plan_path(body):
         # "directions". Do not re-add an "action"/"first_step" single-value
         # field here — that previously caused the agent to forward only
         # the first move per turn instead of the whole route.
-        return {"statusCode": 200, "body": json.dumps({"directions": directions})}
+        return {"directions": directions}, 200
     except Exception as e:
-        return {"statusCode": 200, "body": json.dumps({"directions": ["down", "right", "down", "right"], "message": f"Fallback mode: {str(e)}"})}
+        return {"directions": ["down", "right", "down", "right"], "message": f"Fallback mode: {str(e)}"}, 200
 
 
 # ============================================================================
-# UNIFIED DISPATCH
+# UNIFIED DISPATCH  —  Bedrock-Agent-compatible transport layer
 # ============================================================================
 VALID_ACTIONS = {"execute_code", "scrape_website", "plan_path"}
 
@@ -975,43 +1017,189 @@ def _detect_action(body):
     return None
 
 
+def _detect_schema_type(event):
+    """Identify which of the 3 known event shapes this is."""
+    if not isinstance(event, dict):
+        return "plain"
+    if "function" in event and "parameters" in event:
+        return "function"
+    if "apiPath" in event and "httpMethod" in event:
+        return "openapi"
+    return "plain"
+
+
+def _coerce_param_value(value, ptype=None):
+    """Bedrock Agent parameter values arrive as strings even for
+    non-string types (and complex types like arrays/objects arrive as a
+    JSON-encoded string). Decode JSON-looking strings and cast scalars
+    according to the declared type, without ever raising - fall back to
+    the raw value on any parse failure so a single odd parameter can't
+    crash the whole request."""
+    if not isinstance(value, str):
+        return value
+    s = value.strip()
+    if s.startswith("[") or s.startswith("{"):
+        try:
+            return json.loads(s)
+        except (ValueError, TypeError):
+            pass
+    if ptype in ("integer", "number"):
+        try:
+            return int(s) if ptype == "integer" else float(s)
+        except (TypeError, ValueError):
+            return value
+    if ptype == "boolean":
+        return s.lower() in ("true", "1", "yes")
+    return value
+
+
+def _extract_request(event):
+    """
+    Returns (action, body, schema_type).
+
+    Handles all 3 real shapes an action-group Lambda can receive from
+    Amazon Bedrock Agents, plus a "plain" shape for local/manual testing:
+      - "function" : Function-details action group (parameters is a list
+                      of {"name","type","value"} dicts; action == the
+                      function name)
+      - "openapi"  : OpenAPI-schema action group (params come from
+                      requestBody.content['application/json'].properties;
+                      action == the last path segment of apiPath)
+      - "plain"    : a raw dict already shaped like the tool's own body
+                      (or a legacy API-Gateway-style {"body": "..."}),
+                      used for local self-checks and manual invocation
+    """
+    schema_type = _detect_schema_type(event)
+
+    if schema_type == "function":
+        action = event.get("function")
+        body = {}
+        for p in (event.get("parameters") or []):
+            name = p.get("name")
+            if name is None:
+                continue
+            body[name] = _coerce_param_value(p.get("value"), p.get("type"))
+        return action, body, schema_type
+
+    if schema_type == "openapi":
+        api_path = event.get("apiPath", "") or ""
+        action = api_path.strip("/").split("/")[-1] if api_path else None
+        body = {}
+        req_body = event.get("requestBody", {}) or {}
+        content = req_body.get("content", {}) or {}
+        app_json = content.get("application/json", {}) or {}
+        props = app_json.get("properties", [])
+        if isinstance(props, list):
+            for p in props:
+                name = p.get("name")
+                if name is None:
+                    continue
+                body[name] = _coerce_param_value(p.get("value"), p.get("type"))
+        elif isinstance(props, dict):
+            body = dict(props)
+        return action, body, schema_type
+
+    # "plain": legacy API-Gateway-style test event, or a raw body dict
+    if isinstance(event, dict) and "body" in event and isinstance(event["body"], str):
+        try:
+            body = json.loads(event["body"])
+        except (ValueError, TypeError):
+            body = {}
+    elif isinstance(event, dict):
+        inner = event.get("body", event)
+        body = inner if isinstance(inner, dict) else event
+    else:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    action = str(body.get("action", "")).strip().lower() or _detect_action(body)
+    return action, body, schema_type
+
+
+def _wrap_response(event, schema_type, action, result_dict, status_code=200):
+    """Build the response in the SAME shape the request came in, per the
+    AWS Bedrock Agent Lambda contract (see module docstring)."""
+    body_json = json.dumps(result_dict)
+    session_attributes = event.get("sessionAttributes", {}) if isinstance(event, dict) else {}
+    prompt_session_attributes = event.get("promptSessionAttributes", {}) if isinstance(event, dict) else {}
+
+    if schema_type == "function":
+        return {
+            "messageVersion": "1.0",
+            "response": {
+                "actionGroup": event.get("actionGroup", "unified_specialist"),
+                "function": event.get("function", action),
+                "functionResponse": {
+                    "responseBody": {"TEXT": {"body": body_json}}
+                },
+            },
+            "sessionAttributes": session_attributes,
+            "promptSessionAttributes": prompt_session_attributes,
+        }
+
+    if schema_type == "openapi":
+        return {
+            "messageVersion": "1.0",
+            "response": {
+                "actionGroup": event.get("actionGroup", "unified_specialist"),
+                "apiPath": event.get("apiPath", f"/{action}" if action else "/unknown"),
+                "httpMethod": event.get("httpMethod", "POST"),
+                "httpStatusCode": status_code,
+                "responseBody": {"application/json": {"body": body_json}},
+            },
+            "sessionAttributes": session_attributes,
+            "promptSessionAttributes": prompt_session_attributes,
+        }
+
+    # "plain": keep the original API-Gateway-style shape for backward
+    # compatibility with local testing / manual invocation.
+    return {"statusCode": status_code, "body": body_json}
+
+
 def lambda_handler(event, context):
     """
-    Single entry point for all three merged specialist actions.
-
-    Body params (send exactly one action's params, plus "action"):
-      action: "execute_code" | "scrape_website" | "plan_path"  (recommended)
-      ... plus that action's own params (see each _handle_* docstring above)
-
-    If "action" is omitted, it is auto-detected from which fields are
-    present, for backward compatibility with old single-purpose callers.
+    Single entry point for all three merged specialist actions
+    (execute_code / scrape_website / plan_path), speaking whichever of
+    the 3 known Bedrock-Agent-compatible wire shapes the request used
+    (see module docstring for the full shape reference).
     """
     try:
-        body = json.loads(event["body"]) if "body" in event and isinstance(event["body"], str) else event.get("body", event)
-        if not isinstance(body, dict):
-            body = {}
+        if not isinstance(event, dict):
+            event = {}
 
-        action = str(body.get("action", "")).strip().lower() or _detect_action(body)
+        action, body, schema_type = _extract_request(event)
+        action_norm = str(action or "").strip().lower()
 
-        if action == "execute_code":
-            return _handle_execute_code(body)
-        if action == "scrape_website":
-            return _handle_scrape_website(body)
-        if action == "plan_path":
-            return _handle_plan_path(body)
+        if action_norm == "execute_code":
+            result, status = _run_execute_code(body)
+        elif action_norm == "scrape_website":
+            result, status = _run_scrape_website(body)
+        elif action_norm == "plan_path":
+            result, status = _run_plan_path(body)
+        else:
+            result, status = (
+                {"error": f"Missing or unrecognized action '{action}'. "
+                          f"Expected one of {sorted(VALID_ACTIONS)}, and could not "
+                          f"auto-detect from the given fields."},
+                400,
+            )
 
-        return {
-            "statusCode": 400,
-            "body": json.dumps({
-                "error": f"Missing or unrecognized 'action'. Expected one of {sorted(VALID_ACTIONS)}, "
-                         f"and could not auto-detect from the given fields."
-            })
-        }
+        return _wrap_response(event, schema_type, action_norm, result, status)
+
     except Exception as e:
-        return {
-            "statusCode": 200,
-            "body": json.dumps({"error": f"Fallback mode: {e}"})
-        }
+        # Never let an unhandled exception produce a malformed/empty
+        # Lambda response - that is indistinguishable from a crash to the
+        # Bedrock orchestrator and triggers the same silent-retry loop
+        # that caused the original "technical issue" failure. Always
+        # reply in a shape the caller can parse, with the error inside
+        # the payload instead.
+        try:
+            schema_type = _detect_schema_type(event) if isinstance(event, dict) else "plain"
+            action_norm = str(event.get("function") or "") if isinstance(event, dict) else ""
+            return _wrap_response(event if isinstance(event, dict) else {}, schema_type, action_norm,
+                                   {"error": f"Fallback mode: {e}"}, 200)
+        except Exception:
+            return {"statusCode": 200, "body": json.dumps({"error": f"Fallback mode: {e}"})}
 
 
 # ============================================================================
@@ -1084,8 +1272,8 @@ result = "-".join(str(ord(ch.upper()) - ord('A') + 1) for ch in code if ch.isalp
     assert "Home | About" not in extracted, extracted
     assert "copyright 2026" not in extracted, extracted
 
-    resp_missing_url = _handle_scrape_website({})
-    assert resp_missing_url["statusCode"] == 400, resp_missing_url
+    r_missing_url, status_missing_url = _run_scrape_website({})
+    assert status_missing_url == 400, (status_missing_url, r_missing_url)
 
     print("OK: scrape_website self-checks passed (2, offline only)")
 
@@ -1176,51 +1364,134 @@ result = "-".join(str(ord(ch.upper()) - ord('A') + 1) for ch in code if ch.isalp
     assert "c18" not in TILE_SCORES
     assert "c18" not in FORCE_COLLECT_TYPES
 
-    event_a = {"action": "plan_path", "map": [
+    sample_map = [
         ["start", "normal", "normal", "normal"],
         ["c40", "normal", "normal", "normal"],
         ["normal", "normal", "normal", "normal"],
         ["normal", "normal", "normal", "c30"],
         ["normal", "normal", "normal", "treasure"],
-    ], "start_pos": "B1", "hp": 10}
-    resp_a = lambda_handler(event_a, None)
-    body_a = json.loads(resp_a["body"])
-    assert resp_a["statusCode"] == 200 and body_a["directions"], "start_pos must be accepted and produce a real plan"
+    ]
 
-    event_b = {"action": "plan_path", "map": [
-        ["start", "normal", "normal", "normal"],
-        ["c40", "normal", "normal", "normal"],
-        ["normal", "normal", "normal", "normal"],
-        ["normal", "normal", "normal", "c30"],
-        ["normal", "normal", "normal", "treasure"],
-    ], "start": "A1", "hp": 10, "step_cost": "4:51"}
-    resp_b = lambda_handler(event_b, None)
-    body_b = json.loads(resp_b["body"])
-    assert resp_b["statusCode"] == 200 and body_b["directions"] != ["down", "right", "down", "right"], \
+    r_a, status_a = _run_plan_path({"map": sample_map, "start_pos": "B1", "hp": 10})
+    assert status_a == 200 and r_a["directions"], "start_pos must be accepted and produce a real plan"
+
+    r_b, status_b = _run_plan_path({"map": sample_map, "start": "A1", "hp": 10, "step_cost": "4:51"})
+    assert status_b == 200 and r_b["directions"] != ["down", "right", "down", "right"], \
         "a bad non-numeric step_cost must not crash into the generic hardcoded fallback"
 
     print("OK: plan_path self-checks passed (9)")
 
-    # ---- unified dispatch self-checks (NEW: verifies the merge itself) ----
-    # explicit action="execute_code" through the single lambda_handler
+    # ---- unified dispatch self-checks: "plain" testing shape ----
     resp_c = lambda_handler({"action": "execute_code", "code": "result = 6 * 7"}, None)
+    assert resp_c["statusCode"] == 200, resp_c
     body_c = json.loads(resp_c["body"])
     assert body_c["result"] == 42, body_c
 
-    # auto-detected action (no "action" field, has "code" -> execute_code)
-    resp_d = lambda_handler({"code": "result = 1 + 1"}, None)
+    resp_d = lambda_handler({"code": "result = 1 + 1"}, None)  # auto-detected action
     body_d = json.loads(resp_d["body"])
     assert body_d["result"] == 2, body_d
 
-    # auto-detected action (no "action" field, has "url" -> scrape_website)
     resp_e = lambda_handler({}, None)  # no recognizable fields at all
     assert resp_e["statusCode"] == 400, resp_e
 
-    # explicit action="plan_path" through the single lambda_handler,
-    # reusing event_a's body but forcing dispatch through auto-detect too
-    resp_f = lambda_handler({"map": event_a["map"], "start_pos": "B1", "hp": 10}, None)
+    resp_f = lambda_handler({"map": sample_map, "start_pos": "B1", "hp": 10}, None)  # auto-detected plan_path
     body_f = json.loads(resp_f["body"])
     assert resp_f["statusCode"] == 200 and body_f["directions"], "auto-detected plan_path must still work without 'action'"
 
-    print("OK: unified dispatch self-checks passed (4)")
-    print("ALL SELF-CHECKS PASSED (26 total)")
+    print("OK: unified dispatch self-checks (plain shape) passed (4)")
+
+    # ---- unified dispatch self-checks: REAL Bedrock "function" schema ----
+    # This is the shape a tool named "...___unified_specialist" (as seen
+    # in the combat log) actually receives - the exact case that was
+    # broken before this fix.
+    event_fn_code = {
+        "messageVersion": "1.0",
+        "actionGroup": "unified_specialist",
+        "function": "execute_code",
+        "parameters": [{"name": "code", "type": "string", "value": "result = 6 * 7"}],
+        "sessionAttributes": {}, "promptSessionAttributes": {},
+    }
+    resp_fn = lambda_handler(event_fn_code, None)
+    assert resp_fn["messageVersion"] == "1.0", resp_fn
+    assert resp_fn["response"]["function"] == "execute_code", resp_fn
+    fn_body = json.loads(resp_fn["response"]["functionResponse"]["responseBody"]["TEXT"]["body"])
+    assert fn_body["result"] == 42, fn_body
+
+    event_fn_path = {
+        "messageVersion": "1.0",
+        "actionGroup": "unified_specialist",
+        "function": "plan_path",
+        "parameters": [
+            {"name": "map", "type": "array", "value": json.dumps(sample_map)},
+            {"name": "start_pos", "type": "string", "value": "B1"},
+            {"name": "hp", "type": "integer", "value": "10"},
+        ],
+        "sessionAttributes": {"turn": "1"}, "promptSessionAttributes": {},
+    }
+    resp_fn2 = lambda_handler(event_fn_path, None)
+    assert resp_fn2["sessionAttributes"] == {"turn": "1"}, resp_fn2
+    fn_body2 = json.loads(resp_fn2["response"]["functionResponse"]["responseBody"]["TEXT"]["body"])
+    assert fn_body2["directions"], "function-schema plan_path must return a real directions list"
+
+    event_fn_missing_url = {
+        "messageVersion": "1.0",
+        "actionGroup": "unified_specialist",
+        "function": "scrape_website",
+        "parameters": [],
+    }
+    resp_fn3 = lambda_handler(event_fn_missing_url, None)
+    fn_body3 = json.loads(resp_fn3["response"]["functionResponse"]["responseBody"]["TEXT"]["body"])
+    assert "error" in fn_body3, "function-schema must still surface a clear error, never crash/empty-reply"
+
+    print("OK: unified dispatch self-checks (Bedrock function schema) passed (3)")
+
+    # ---- unified dispatch self-checks: REAL Bedrock "OpenAPI" schema ----
+    event_oa_code = {
+        "messageVersion": "1.0",
+        "actionGroup": "unified_specialist",
+        "apiPath": "/execute_code",
+        "httpMethod": "POST",
+        "requestBody": {"content": {"application/json": {"properties": [
+            {"name": "code", "type": "string", "value": "result = 100 - 58"},
+        ]}}},
+    }
+    resp_oa = lambda_handler(event_oa_code, None)
+    assert resp_oa["messageVersion"] == "1.0", resp_oa
+    assert resp_oa["response"]["httpStatusCode"] == 200, resp_oa
+    oa_body = json.loads(resp_oa["response"]["responseBody"]["application/json"]["body"])
+    assert oa_body["result"] == 42, oa_body
+
+    event_oa_path = {
+        "messageVersion": "1.0",
+        "actionGroup": "unified_specialist",
+        "apiPath": "/plan_path",
+        "httpMethod": "POST",
+        "requestBody": {"content": {"application/json": {"properties": [
+            {"name": "map", "type": "array", "value": json.dumps(sample_map)},
+            {"name": "start_pos", "type": "string", "value": "B1"},
+            {"name": "hp", "type": "integer", "value": "10"},
+        ]}}},
+    }
+    resp_oa2 = lambda_handler(event_oa_path, None)
+    oa_body2 = json.loads(resp_oa2["response"]["responseBody"]["application/json"]["body"])
+    assert resp_oa2["response"]["httpStatusCode"] == 200 and oa_body2["directions"], \
+        "OpenAPI-schema plan_path must return a real directions list"
+
+    event_oa_missing_url = {
+        "messageVersion": "1.0",
+        "actionGroup": "unified_specialist",
+        "apiPath": "/scrape_website",
+        "httpMethod": "POST",
+        "requestBody": {"content": {"application/json": {"properties": []}}},
+    }
+    resp_oa3 = lambda_handler(event_oa_missing_url, None)
+    assert resp_oa3["response"]["httpStatusCode"] == 400, resp_oa3
+
+    print("OK: unified dispatch self-checks (Bedrock OpenAPI schema) passed (3)")
+
+    # ---- unrecognized/garbage event must never crash into a bare exception ----
+    resp_garbage = lambda_handler({"totally": "unrelated", "fields": 123}, None)
+    assert resp_garbage["statusCode"] == 400, resp_garbage
+
+    print("OK: unrecognized-event safety check passed (1)")
+    print("ALL SELF-CHECKS PASSED (34 total)")
