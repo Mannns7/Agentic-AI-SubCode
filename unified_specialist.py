@@ -117,7 +117,7 @@ CODE_SAFE_MODULES = {
     "decimal": __import__("decimal"),
     "fractions": __import__("fractions"),
     "string": __import__("string"),  # e.g. string.ascii_uppercase — handy for
-                                      # cipher/alphabet challenges (c30/c31 doors)
+                                      # cipher/alphabet challenges (c32/c33 doors)
 }
 
 CODE_EXEC_TIMEOUT_SECONDS = 10
@@ -240,15 +240,16 @@ def _run_execute_code(body):
               return a
           result = str(fib(3000))[-10:]
 
-    - c30 Red Door: cipher is "read the received code backwards".
-          result = given_code[::-1]
+    - c32 Grey Door: cipher is "combine the first two characters and the
+      last two characters of the key".
+          result = given_code[:2] + given_code[-2:]
 
-    - c31 Green Door: cipher is "replace each letter with the number
-      representing its position in the alphabet (A=1, B=2, ... Z=26)".
-          result = "-".join(str(ord(ch.upper()) - ord('A') + 1)
-                             for ch in given_code if ch.isalpha())
-      (Adjust the join/format to match whatever the game literally asks
-      for — join with spaces, dashes, or no separator as specified.)
+    - c33 Yellow Door: cipher is "give the 5th and 7th character of the
+      key" (1-indexed, per the door's own wording).
+          result = given_code[4] + given_code[6]
+      (These transforms are stated by each door's own challenge text and
+      can change between rounds - always follow what the door itself
+      says, do not assume these examples are the current rule.)
     """
     try:
         code = body.get("code")
@@ -356,30 +357,34 @@ def _run_scrape_website(body):
 # ============================================================================
 DANGER_COST = 1000
 DOOR_COST_LOCKED = 5000
-LOCKED_DOOR_HP_DAMAGE = 5  # guide: crossing a locked c30/c31 door does -5 real damage
+LOCKED_DOOR_HP_DAMAGE = 5  # guide: crossing a locked c32/c33 door does -5 real damage
 
 # Tile scores, matched exactly to the challenge guide for this round.
+# NOTE (map update): this round's guide swapped Red/Green key+door for
+# Grey (c42 key / c32 door) and Yellow (c43 key / c33 door), and dropped
+# "c3 Memento" entirely (not present in this round's guide). "c18" is
+# back this round as Healthcare API (+500).
 TILE_SCORES = {
     "c1": 400,   # Violent Violet
     "c2": 600,   # Blue Brain / Code Challenge
-    "c3": 550,   # Memento / Memory Trial
     "c4": 800,   # Dark Prophet / Web Search
     "c5": 250,   # Bonehead / Simple Question
     "c7": 250,   # Coins
     "c17": 50,   # A Distraction
-    "c30": 1000,  # Red Door
-    "c31": 1000,  # Green Door
-    "c40": 50,   # Red Key
-    "c41": 50,   # Green Key
+    "c18": 500,  # Healthcare API
+    "c32": 1000,  # Grey Door
+    "c33": 1000,  # Yellow Door
+    "c42": 50,   # Grey Key
+    "c43": 50,   # Yellow Key
 }
 DEFAULT_CHALLENGE_SCORE = 400
 
 # Which challenge-tile type is a KEY, and which color it unlocks; and
 # which type is a DOOR, and which color it requires. Extend these two
-# dicts if a future round adds more key/door colors (e.g. c42/c32 blue) -
-# no other code needs to change, everything below is colour-generic.
-KEY_COLOR_MAP = {"c40": "red", "c41": "green"}
-DOOR_COLOR_MAP = {"c30": "red", "c31": "green"}
+# dicts if a future round adds more key/door colors - no other code
+# needs to change, everything below is colour-generic.
+KEY_COLOR_MAP = {"c42": "grey", "c43": "yellow"}
+DOOR_COLOR_MAP = {"c32": "grey", "c33": "yellow"}
 
 # Real, certain HP loss only comes from c8 spikes and locked doors (any
 # color); challenge-tile HP cost is a tunable "risk buffer" that defaults
@@ -393,8 +398,10 @@ DEFAULT_STEP_COST = 3
 # Tile types that must ALWAYS be visited when safely reachable, regardless
 # of whether the profit-maximizing selection thinks it's "worth" the
 # detour. Doors/keys are deliberately NOT forced — the score-vs-cost
-# optimizer decides whether they're worth taking.
-FORCE_COLLECT_TYPES = {"c1", "c2", "c3", "c4", "c5"}
+# optimizer decides whether they're worth taking. c18 (Healthcare API) is
+# a real quest challenge this round, so it's forced too; c3 (Memento) is
+# not in this round's guide at all, so it has been removed.
+FORCE_COLLECT_TYPES = {"c1", "c2", "c4", "c5", "c18"}
 
 # Max nodes (forced+optional combined) for the EXACT Held-Karp solve.
 EXACT_SOLVE_LIMIT = 15
@@ -1341,34 +1348,36 @@ result = "-".join(str(ord(ch.upper()) - ord('A') + 1) for ch in code if ch.isalp
     v5 = _walk((0, 0), d5)
     assert (0, 1) in v5 and (0, 2) in v5 and (0, 3) in v5, "forced non-hazard challenge tiles must not be dropped under a tight but non-hazardous HP budget"
 
-    green_map = [
+    yellow_map = [
         ["start", "normal", "normal", "normal"],
-        ["c41", "normal", "normal", "normal"],
+        ["c43", "normal", "normal", "normal"],
         ["normal", "normal", "normal", "normal"],
-        ["normal", "normal", "normal", "c31"],
+        ["normal", "normal", "normal", "c33"],
         ["normal", "normal", "normal", "treasure"],
     ]
-    d6 = plan_path((0, 0), green_map, hp_remaining=10, step_cost=1)
+    d6 = plan_path((0, 0), yellow_map, hp_remaining=10, step_cost=1)
     v6 = _walk((0, 0), d6)
-    assert (1, 0) in v6, "green key (c41) must be collected"
-    assert (3, 3) in v6, "green door (c31) must be visited/opened"
+    assert (1, 0) in v6, "yellow key (c43) must be collected"
+    assert (3, 3) in v6, "yellow door (c33) must be visited/opened"
     key_step = v6.index((1, 0))
     door_step = v6.index((3, 3))
-    assert key_step < door_step, "green key must be collected BEFORE reaching the green door"
+    assert key_step < door_step, "yellow key must be collected BEFORE reaching the yellow door"
 
     assert TILE_SCORES["c17"] == 50
-    assert TILE_SCORES["c40"] == 50
-    assert TILE_SCORES["c41"] == 50
-    assert TILE_SCORES["c30"] == 1000
-    assert TILE_SCORES["c31"] == 1000
-    assert "c18" not in TILE_SCORES
-    assert "c18" not in FORCE_COLLECT_TYPES
+    assert TILE_SCORES["c42"] == 50
+    assert TILE_SCORES["c43"] == 50
+    assert TILE_SCORES["c32"] == 1000
+    assert TILE_SCORES["c33"] == 1000
+    assert TILE_SCORES["c18"] == 500
+    assert "c18" in FORCE_COLLECT_TYPES
+    assert "c3" not in TILE_SCORES
+    assert "c3" not in FORCE_COLLECT_TYPES
 
     sample_map = [
         ["start", "normal", "normal", "normal"],
-        ["c40", "normal", "normal", "normal"],
+        ["c42", "normal", "normal", "normal"],
         ["normal", "normal", "normal", "normal"],
-        ["normal", "normal", "normal", "c30"],
+        ["normal", "normal", "normal", "c32"],
         ["normal", "normal", "normal", "treasure"],
     ]
 
