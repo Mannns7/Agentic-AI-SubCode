@@ -2,10 +2,16 @@
 Memory Core Agent Lambda
 =========================
 Implements the "myAgentMemory" tool referenced throughout supervisor_prompt.md
-(c3 Memento context lookups, c40/c41 key storage, c30/c31 key/code lookups
-for door ciphers). Previously this tool had NO implementation at all - only
-a short usage note in memory_tool_description.md. This file rebuilds it as
-a real, deployable Bedrock Agent action-group Lambda.
+(context lookups, c42/c43 key storage, c32/c33 key/code lookups for door
+ciphers). Previously this tool had NO implementation at all - only a short
+usage note in memory_tool_description.md. This file rebuilds it as a real,
+deployable Bedrock Agent action-group Lambda.
+
+NOTE: the key/value store itself is color-agnostic (any string key works),
+so no code below needed to change when this round's map swapped Red/Green
+keys+doors for Grey (c42/c32) and Yellow (c43/c33) - only the comments and
+docstrings below (and the delegating supervisor prompts) referenced the
+old colors/codes, and have been updated to match.
 
 --------------------------------------------------------------------
 HOW MEMORY PERSISTS ACROSS TURNS (no external database needed)
@@ -48,7 +54,8 @@ group):
   retrieve      - key                    -> read one memory slot back
   retrieve_all  - (no params)            -> dump every stored slot + log
   log_note      - note, [turn]           -> append a freeform context note
-                                             (for c3 "what happened before")
+                                             (for "what happened before"
+                                             recall questions)
   clear         - (no params)            -> wipe all memory (new game only)
 
 Deploying this file:
@@ -113,10 +120,10 @@ def _run_store(body, memory):
     """
     Params: key (string, required), value (any - stored as given)
 
-    Use for c40 Red Key / c41 Green Key on receipt: store(key="red_key",
+    Use for c42 Grey Key / c43 Yellow Key on receipt: store(key="grey_key",
     value="<exact value received>"). The supervisor's own reply text must
     restate the exact value (see supervisor_prompt.md) - this action just
-    persists it for later c30/c31 retrieval.
+    persists it for later c32/c33 retrieval.
     """
     key = body.get("key")
     value = body.get("value")
@@ -132,8 +139,8 @@ def _run_retrieve(body, memory):
     """
     Params: key (string, required)
 
-    Use for c30 Red Door / c31 Green Door: retrieve(key="red_key") to get
-    back the exact value stored earlier by c40/c41, before applying
+    Use for c32 Grey Door / c33 Yellow Door: retrieve(key="grey_key") to
+    get back the exact value stored earlier by c42/c43, before applying
     whatever cipher/transform that specific door's own question states.
     """
     key = body.get("key")
@@ -149,11 +156,12 @@ def _run_retrieve_all(body, memory):
     """
     No params required.
 
-    Use for c3 Memento: returns every stored key/value plus the full
-    freeform context log, so the supervisor can answer "what happened
-    earlier" style questions. This action never computes/counts anything
-    itself - any exact counting over the returned data must still be
-    delegated to execute_code, per supervisor_prompt.md.
+    Use whenever the supervisor needs to recall prior map/interaction
+    context: returns every stored key/value plus the full freeform
+    context log, so the supervisor can answer "what happened earlier"
+    style questions. This action never computes/counts anything itself -
+    any exact counting over the returned data must still be delegated to
+    execute_code, per supervisor_prompt.md.
     """
     return {"kv": dict(memory["kv"]), "log": list(memory["log"])}, 200
 
@@ -163,9 +171,9 @@ def _run_log_note(body, memory):
     Params: note (string, required), turn (optional, any)
 
     Use for recording general map/interaction context as it happens
-    (e.g. "Saw c3 challenge at B2 asking about coin count", "Opened red
-    door at F5"), independent of the key/value store, so c3 Memento
-    questions later have real prior context to query via retrieve_all.
+    (e.g. "Saw a counting challenge at B2", "Opened grey door at F5"),
+    independent of the key/value store, so later "what happened before"
+    questions have real prior context to query via retrieve_all.
     """
     note = body.get("note")
     if not note or not isinstance(note, str):
@@ -181,7 +189,7 @@ def _run_clear(body, memory):
     No params required. Wipes all stored key/values and the log.
 
     Only call this at the very start of a brand-new game - never mid-game,
-    or c30/c31 door lookups and c3 Memento context will silently lose
+    or c32/c33 door lookups and prior context recall will silently lose
     everything collected so far.
     """
     memory["kv"].clear()
@@ -395,39 +403,39 @@ if __name__ == "__main__":
     print("OK: decode/encode self-checks passed (3)")
 
     # ---- store / retrieve round trip (plain shape) ----
-    resp1 = lambda_handler({"action": "store", "key": "red_key", "value": "MalaysiaBoleh"}, None)
+    resp1 = lambda_handler({"action": "store", "key": "grey_key", "value": "MalaysiaBoleh"}, None)
     assert resp1["statusCode"] == 200, resp1
     body1 = json.loads(resp1["body"])
     assert body1["stored"] is True and body1["value"] == "MalaysiaBoleh", body1
     carried_session = resp1["session_attributes"]
 
-    resp2 = lambda_handler({"action": "retrieve", "key": "red_key", "session_attributes": carried_session}, None)
+    resp2 = lambda_handler({"action": "retrieve", "key": "grey_key", "session_attributes": carried_session}, None)
     body2 = json.loads(resp2["body"])
     assert body2["found"] is True and body2["value"] == "MalaysiaBoleh", \
         "value stored in turn 1 must be retrievable in turn 2 via carried session_attributes"
 
-    resp3 = lambda_handler({"action": "retrieve", "key": "green_key", "session_attributes": carried_session}, None)
+    resp3 = lambda_handler({"action": "retrieve", "key": "yellow_key", "session_attributes": carried_session}, None)
     body3 = json.loads(resp3["body"])
     assert body3["found"] is False and body3["value"] is None, "unknown key must report found=False, never error"
 
     print("OK: store/retrieve round-trip self-checks passed (3)")
 
     # ---- log_note + retrieve_all ----
-    resp4 = lambda_handler({"action": "log_note", "note": "Collected green key on B2", "turn": 3,
+    resp4 = lambda_handler({"action": "log_note", "note": "Collected yellow key on B2", "turn": 3,
                              "session_attributes": carried_session}, None)
     body4 = json.loads(resp4["body"])
     assert body4["logged"] is True, body4
     carried_session2 = resp4["session_attributes"]
 
-    resp5 = lambda_handler({"action": "store", "key": "green_key", "value": "OpenSesame",
+    resp5 = lambda_handler({"action": "store", "key": "yellow_key", "value": "OpenSesame",
                              "session_attributes": carried_session2}, None)
     carried_session3 = json.loads(resp5["body"]) and resp5["session_attributes"]
 
     resp6 = lambda_handler({"action": "retrieve_all", "session_attributes": carried_session3}, None)
     body6 = json.loads(resp6["body"])
-    assert body6["kv"] == {"red_key": "MalaysiaBoleh", "green_key": "OpenSesame"}, body6
-    assert any(entry.get("note") == "Collected green key on B2" for entry in body6["log"]), body6
-    assert any(entry.get("key") == "red_key" for entry in body6["log"]), "store actions must also land in the log for c3 context"
+    assert body6["kv"] == {"grey_key": "MalaysiaBoleh", "yellow_key": "OpenSesame"}, body6
+    assert any(entry.get("note") == "Collected yellow key on B2" for entry in body6["log"]), body6
+    assert any(entry.get("key") == "grey_key" for entry in body6["log"]), "store actions must also land in the log for later recall"
 
     print("OK: log_note/retrieve_all self-checks passed (2)")
 
@@ -462,7 +470,7 @@ if __name__ == "__main__":
         "actionGroup": "myAgentMemory",
         "function": "store",
         "parameters": [
-            {"name": "key", "type": "string", "value": "red_key"},
+            {"name": "key", "type": "string", "value": "grey_key"},
             {"name": "value", "type": "string", "value": "MalaysiaBoleh"},
         ],
         "sessionAttributes": {}, "promptSessionAttributes": {},
@@ -479,7 +487,7 @@ if __name__ == "__main__":
         "messageVersion": "1.0",
         "actionGroup": "myAgentMemory",
         "function": "retrieve",
-        "parameters": [{"name": "key", "type": "string", "value": "red_key"}],
+        "parameters": [{"name": "key", "type": "string", "value": "grey_key"}],
         "sessionAttributes": fn_session, "promptSessionAttributes": {"turn": "2"},
     }
     resp_fn2 = lambda_handler(event_fn_retrieve, None)
@@ -497,7 +505,7 @@ if __name__ == "__main__":
         "apiPath": "/store",
         "httpMethod": "POST",
         "requestBody": {"content": {"application/json": {"properties": [
-            {"name": "key", "type": "string", "value": "green_key"},
+            {"name": "key", "type": "string", "value": "yellow_key"},
             {"name": "value", "type": "string", "value": "OpenSesame"},
         ]}}},
     }
@@ -513,7 +521,7 @@ if __name__ == "__main__":
         "apiPath": "/retrieve",
         "httpMethod": "POST",
         "requestBody": {"content": {"application/json": {"properties": [
-            {"name": "key", "type": "string", "value": "green_key"},
+            {"name": "key", "type": "string", "value": "yellow_key"},
         ]}}},
         "sessionAttributes": oa_session,
     }
