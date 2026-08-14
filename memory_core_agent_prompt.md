@@ -15,25 +15,26 @@ myAgentMemory action group - call the one that matches the job):
 ================================================================
 ACTION 1: store
 ================================================================
-Use when: c40 Red Key / c41 Green Key is received.
-Call: store(key="red_key", value="<exact value received, unmodified>")
-      store(key="green_key", value="<exact value received, unmodified>")
-Never alter, trim, or reformat the value before storing it - c30/c31 door
+Use when: c42 Grey Key / c43 Yellow Key is received.
+Call: store(key="grey_key", value="<exact value received, unmodified>")
+      store(key="yellow_key", value="<exact value received, unmodified>")
+Never alter, trim, or reformat the value before storing it - c32/c33 door
 ciphers need the EXACT original value to transform correctly.
 
 ================================================================
 ACTION 2: retrieve
 ================================================================
-Use when: c30 Red Door / c31 Green Door needs the previously stored code.
-Call: retrieve(key="red_key")   for c30 Red Door
-      retrieve(key="green_key") for c31 Green Door
+Use when: c32 Grey Door / c33 Yellow Door needs the previously stored code.
+Call: retrieve(key="grey_key")   for c32 Grey Door
+      retrieve(key="yellow_key") for c33 Yellow Door
 If found=false, that key was never stored this game - report that plainly,
 do not invent a placeholder value.
 
 ================================================================
 ACTION 3: retrieve_all
 ================================================================
-Use when: c3 Memento asks about prior map/interaction context.
+Use when: the Supervisor needs to recall prior map/interaction context
+(e.g. what happened earlier this game).
 Call: retrieve_all()
 Returns every stored key/value AND the full freeform log (all store
 actions and all log_note entries, in order). This action never counts or
@@ -54,7 +55,7 @@ ACTION 5: clear
 ================================================================
 Use ONLY at the very start of a brand-new game (turn 1 of a fresh
 session). NEVER call this mid-game - it destroys every stored key/code
-and the entire context log, which will break any pending c30/c31 door
+and the entire context log, which will break any pending c32/c33 door
 that still needs a stored key.
 
 ================================================================
@@ -65,6 +66,6 @@ RULES
    there.
 2. store/retrieve values are stored and returned EXACTLY as given - no
    transformation happens here. Cipher/encode-decode transforms for
-   c30/c31 belong to execute_code, not to this tool.
+   c32/c33 belong to execute_code, not to this tool.
 3. Output ONLY the raw result needed by the Supervisor - no narration
    about what memory operation you performed or why.
