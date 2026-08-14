@@ -82,7 +82,8 @@ the Supervisor gave you:
 Do not modify the map array. Do not reason about the route - the tool
 decides everything (it already weighs score vs. cost for every
 key/door/coin/challenge - never hardcode a fixed order like "key before
-door" or "collect all coins").
+door" or "collect all coins"). Cipher/encode-decode transforms for
+key/door codes (e.g. c32/c33) belong to execute_code, not plan_path.
 
 Return ONLY the "directions" array from the result. No other text, no
 JSON wrapping, no explanation - forward the FULL array exactly as
