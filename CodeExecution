@@ -29,7 +29,7 @@ SAFE_MODULES = {
     "decimal": __import__("decimal"),
     "fractions": __import__("fractions"),
     "string": __import__("string"),  # e.g. string.ascii_uppercase — handy for
-                                      # cipher/alphabet challenges (c30/c31 doors)
+                                      # cipher/alphabet challenges (c32/c33 doors)
 }
 
 EXEC_TIMEOUT_SECONDS = 10
@@ -152,15 +152,16 @@ def lambda_handler(event, context):
               return a
           result = str(fib(3000))[-10:]
 
-    - c30 Red Door: cipher is "read the received code backwards".
-          result = given_code[::-1]
+    - c32 Grey Door: cipher is "combine the first two characters and the
+      last two characters of the key".
+          result = given_code[:2] + given_code[-2:]
 
-    - c31 Green Door: cipher is "replace each letter with the number
-      representing its position in the alphabet (A=1, B=2, ... Z=26)".
-          result = "-".join(str(ord(ch.upper()) - ord('A') + 1)
-                             for ch in given_code if ch.isalpha())
-      (Adjust the join/format to match whatever the game literally asks
-      for — join with spaces, dashes, or no separator as specified.)
+    - c33 Yellow Door: cipher is "give the 5th and 7th character of the
+      key" (1-indexed, per the door's own wording).
+          result = given_code[4] + given_code[6]
+      (These transforms are stated by each door's own challenge text and
+      can change between rounds - always follow what the door itself
+      says, do not assume these examples are the current rule.)
 
     Body params:
       code: string — Python code to execute (required)
@@ -231,16 +232,14 @@ result = fib(3000)
     r = execute_code("import string\nresult = string.ascii_uppercase")
     assert r["result"] == "ABCDEFGHIJKLMNOPQRSTUVWXYZ", r
 
-    # c30 Red Door: "translate the code by reading it backwards"
-    r = execute_code("code = 'open'\nresult = code[::-1]")
-    assert r["result"] == "nepo", r
+    # c32 Grey Door: "combine the first two characters and the last two
+    # characters of the key"
+    r = execute_code("code = 'MalaysiaBoleh'\nresult = code[:2] + code[-2:]")
+    assert r["result"] == "Maeh", r
 
-    # c31 Green Door: "replace letters with the numbers that represent
-    # them in order" (A=1, B=2, ... Z=26)
-    r = execute_code("""
-code = 'open'
-result = "-".join(str(ord(ch.upper()) - ord('A') + 1) for ch in code if ch.isalpha())
-""")
-    assert r["result"] == "15-16-5-14", r  # o=15, p=16, e=5, n=14
+    # c33 Yellow Door: "give the 5th and 7th character of the key"
+    # (1-indexed: M-a-l-a-y-s-i-a-B-o-l-e-h -> 5th='y', 7th='i')
+    r = execute_code("code = 'MalaysiaBoleh'\nresult = code[4] + code[6]")
+    assert r["result"] == "yi", r
 
     print("OK: all self-checks passed")
