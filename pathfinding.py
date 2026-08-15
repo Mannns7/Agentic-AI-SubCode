@@ -20,6 +20,14 @@ DEFAULT_KEY_SCORE = 50      # any "c4X" key not explicitly listed
 CHALLENGE_HP_COST = 1
 DEFAULT_STEP_COST = 3
 
+# Keep one movement reply below the game's/model's single-message output
+# ceiling. The supplied 79-step route was visibly split into two chat
+# bubbles; the game consumed the first incomplete fragment and ended while
+# the agent was still at A5. ponytail: this prioritizes a guaranteed safe
+# route to treasure over optional score once a route exceeds 48 moves;
+# upgrade to paged/stateful movement when the game supports route chunks.
+MAX_ROUTE_DIRECTIONS = 48
+
 # Tile types that must ALWAYS be visited when safely reachable, regardless
 # of whether the profit-maximizing selection thinks it's "worth" the
 # detour. Use this for tiles you want guaranteed coverage of.
@@ -691,7 +699,27 @@ def plan_path(start, game_map, hp_remaining=5, step_cost=DEFAULT_STEP_COST):
 
     if not best_path:
         return []
-    return _path_to_directions(best_path)
+    directions = _path_to_directions(best_path)
+    if len(directions) <= MAX_ROUTE_DIRECTIONS:
+        return directions
+
+    # The score-maximizing route cannot be delivered atomically without
+    # being split by the model/game output ceiling. Fall back to the
+    # existing hazard-aware shortest path, not a truncated prefix: a
+    # prefix strands the agent and the omitted tail never reaches treasure.
+    direct_path, direct_hp_cost = _find_path(
+        start, treasure, rows, cols, barriers, dangers, door_map,
+        frozenset(), treasure=treasure,
+    )
+    direct_moves = len(direct_path) - 1 if direct_path else 0
+    if (direct_path is None or direct_hp_cost >= hp_remaining or
+            direct_moves > MAX_ROUTE_DIRECTIONS):
+        logger.error("no atomic safe route: direct route has %d moves (limit %d)",
+                     direct_moves, MAX_ROUTE_DIRECTIONS)
+        return []
+    logger.warning("optimized route has %d moves (limit %d); using %d-move safe treasure route",
+                   len(directions), MAX_ROUTE_DIRECTIONS, direct_moves)
+    return _path_to_directions(direct_path)
 
 
 def _coerce_number(value, default, field_name=""):
@@ -708,29 +736,137 @@ def _coerce_number(value, default, field_name=""):
         return default
 
 
+def _detect_schema_type(event):
+    """Detect the invocation envelope used by Bedrock or local tests."""
+    if not isinstance(event, dict):
+        return "plain"
+    if "function" in event and "parameters" in event:
+        return "function"
+    if "apiPath" in event and "httpMethod" in event:
+        return "openapi"
+    return "plain"
+
+
+def _coerce_param_value(value, ptype=None):
+    """Decode Bedrock's JSON-encoded array/object parameter values."""
+    if not isinstance(value, str):
+        return value
+    s = value.strip()
+    if s.startswith("[") or s.startswith("{"):
+        try:
+            return json.loads(s)
+        except (TypeError, ValueError):
+            return value
+    if ptype in ("integer", "number"):
+        try:
+            return int(s) if ptype == "integer" else float(s)
+        except (TypeError, ValueError):
+            return value
+    return value
+
+
+def _extract_request(event):
+    """Return (body, schema_type) for Bedrock function/OpenAPI/plain calls."""
+    schema_type = _detect_schema_type(event)
+    if schema_type == "function":
+        body = {}
+        for param in event.get("parameters") or []:
+            name = param.get("name")
+            if name:
+                body[name] = _coerce_param_value(param.get("value"), param.get("type"))
+        return body, schema_type
+    if schema_type == "openapi":
+        properties = (((event.get("requestBody") or {}).get("content") or {})
+                      .get("application/json", {}).get("properties", []))
+        if isinstance(properties, dict):
+            return dict(properties), schema_type
+        body = {}
+        for param in properties:
+            name = param.get("name")
+            if name:
+                body[name] = _coerce_param_value(param.get("value"), param.get("type"))
+        return body, schema_type
+    if isinstance(event, dict) and isinstance(event.get("body"), str):
+        try:
+            return json.loads(event["body"]), schema_type
+        except (TypeError, ValueError):
+            return {}, schema_type
+    if isinstance(event, dict):
+        body = event.get("body", event)
+        return (body if isinstance(body, dict) else {}), schema_type
+    return {}, schema_type
+
+
+def _wrap_response(event, schema_type, result, status_code=200):
+    """Reply in the same envelope Bedrock used to invoke this Lambda."""
+    body_json = json.dumps(result)
+    if schema_type == "function":
+        return {
+            "messageVersion": "1.0",
+            "response": {
+                "actionGroup": event.get("actionGroup", "PathfindingLambdaTarget"),
+                "function": event.get("function", "plan_path"),
+                "functionResponse": {"responseBody": {"TEXT": {"body": body_json}}},
+            },
+            "sessionAttributes": event.get("sessionAttributes", {}),
+            "promptSessionAttributes": event.get("promptSessionAttributes", {}),
+        }
+    if schema_type == "openapi":
+        return {
+            "messageVersion": "1.0",
+            "response": {
+                "actionGroup": event.get("actionGroup", "PathfindingLambdaTarget"),
+                "apiPath": event.get("apiPath", "/plan_path"),
+                "httpMethod": event.get("httpMethod", "POST"),
+                "httpStatusCode": status_code,
+                "responseBody": {"application/json": {"body": body_json}},
+            },
+            "sessionAttributes": event.get("sessionAttributes", {}),
+            "promptSessionAttributes": event.get("promptSessionAttributes", {}),
+        }
+    return {"statusCode": status_code, "body": body_json}
+
+
 def lambda_handler(event, context):
+    """
+    Bedrock-compatible plan_path entrypoint.
+
+    Never invent fallback moves. The old fallback was ["down", "right"];
+    on the supplied map the agent starts at A5 and A6 is a wall, so any
+    input/transport error became an immediate guaranteed collision.
+    Returning an explicit error lets the supervisor retry instead of
+    turning a recoverable tool error into a lost game.
+    """
     try:
-        body = json.loads(event["body"]) if "body" in event and isinstance(event["body"], str) else event.get("body", event)
+        if not isinstance(event, dict):
+            event = {}
+        body, schema_type = _extract_request(event)
         game_map = body.get("map", body.get("game_map", body.get("grid", [])))
-        if game_map:
-            max_cols = max(len(row) for row in game_map)
-            game_map = [row + ["normal"] * (max_cols - len(row)) for row in game_map]
-        start_raw = body.get("start", body.get("start_pos", body.get("position", body.get("agent_position", "A1"))))
+        if not isinstance(game_map, list) or not game_map:
+            return _wrap_response(event, schema_type,
+                                  {"directions": [], "error": "Missing non-empty map/game_map/grid."}, 400)
+        if not all(isinstance(row, list) for row in game_map):
+            return _wrap_response(event, schema_type,
+                                  {"directions": [], "error": "Map rows must be arrays."}, 400)
+        max_cols = max(len(row) for row in game_map)
+        game_map = [row + ["normal"] * (max_cols - len(row)) for row in game_map]
+        start_raw = body.get("start", body.get("start_pos", body.get("position",
+                    body.get("current_position", body.get("agent_position", "A1")))))
         start = _parse_start(start_raw)
-        hp_raw = body.get("hp", body.get("health", body.get("life_points", 5)))
+        hp_raw = body.get("hp", body.get("current_hp", body.get("health", body.get("life_points", 5))))
         hp = _coerce_number(hp_raw, 5, "hp")
         step_cost_raw = body.get("step_cost", body.get("time_penalty", DEFAULT_STEP_COST))
         step_cost = _coerce_number(step_cost_raw, DEFAULT_STEP_COST, "step_cost")
         directions = plan_path(start, game_map, hp_remaining=hp, step_cost=step_cost)
         if not directions:
-            directions = ["down", "right"]
-        # Only ever return ONE field for the move list, named "directions".
-        # A duplicate "action"/"path" field reads, to an LLM consuming this
-        # tool's result, as "the thing to output" - risking the agent
-        # forwarding just directions[0] instead of the whole route.
-        return {"statusCode": 200, "body": json.dumps({"directions": directions})}
-    except Exception as e:
-        return {"statusCode": 200, "body": json.dumps({"directions": ["down", "right", "down", "right"], "message": f"Fallback mode: {str(e)}"})}
+            return _wrap_response(event, schema_type,
+                                  {"directions": [], "error": "No safe route found; no movement was issued."}, 422)
+        return _wrap_response(event, schema_type, {"directions": directions})
+    except Exception as exc:
+        logger.exception("plan_path failed")
+        schema_type = _detect_schema_type(event)
+        return _wrap_response(event, schema_type,
+                              {"directions": [], "error": f"plan_path failed: {exc}"}, 500)
 
 
 if __name__ == "__main__":
@@ -836,4 +972,86 @@ if __name__ == "__main__":
     assert (0, 1) not in v5 and (1, 1) not in v5, f"route walked through a 'brick' wall: {v5}"
     assert v5[-1] == (2, 2), "must still reach the treasure around the wall"
 
-    print("OK: all self-checks passed (including multi-door/key support, locked-door scoring, and start/wall fixes)")
+    # Exact regression map reconstructed cell-for-cell from the supplied
+    # 10x10 screenshot (A-J, rows 1-10). This is the real layout that
+    # starts at A5: A6-C6 are walls, so the old invented fallback
+    # ["down", "right"] lost immediately by walking from A5 into A6.
+    supplied_map = [
+        ["c42", "c5", "normal", "normal", "c1", "normal", "c7", "normal", "normal", "treasure"],
+        ["c17", "normal", "normal", "c4", "wall", "normal", "normal", "normal", "normal", "normal"],
+        ["normal", "normal", "normal", "normal", "wall", "c43", "normal", "normal", "normal", "normal"],
+        ["wall", "wall", "wall", "c2", "wall", "wall", "c8", "wall", "wall", "c33"],
+        ["start", "normal", "normal", "normal", "c8", "normal", "normal", "normal", "normal", "normal"],
+        ["wall", "wall", "wall", "c8", "wall", "wall", "wall", "wall", "wall", "c32"],
+        ["c8", "normal", "normal", "normal", "wall", "c7", "c7", "c7", "c7", "c1"],
+        ["c4", "normal", "normal", "c17", "wall", "c5", "c7", "c7", "c7", "c7"],
+        ["normal", "normal", "normal", "normal", "wall", "wall", "wall", "wall", "wall", "normal"],
+        ["c8", "normal", "normal", "c5", "c2", "c7", "c7", "c7", "c7", "c7"],
+    ]
+    supplied_event = {
+        "messageVersion": "1.0",
+        "actionGroup": "PathfindingLambdaTarget",
+        "function": "plan_path",
+        "parameters": [
+            {"name": "map", "type": "array", "value": json.dumps(supplied_map)},
+            {"name": "start_pos", "type": "object", "value": json.dumps({"row": 4, "col": 0})},
+            {"name": "hp", "type": "integer", "value": "5"},
+            {"name": "step_cost", "type": "number", "value": "3"},
+        ],
+        "sessionAttributes": {},
+        "promptSessionAttributes": {},
+    }
+    supplied_response = lambda_handler(supplied_event, None)
+    supplied_body = json.loads(
+        supplied_response["response"]["functionResponse"]["responseBody"]["TEXT"]["body"]
+    )
+    supplied_directions = supplied_body["directions"]
+    assert supplied_directions and "error" not in supplied_body, supplied_body
+    supplied_visited = _walk((4, 0), supplied_directions)
+    supplied_grid = _build_grid(supplied_map)
+    supplied_barriers, supplied_coins = supplied_grid[3], supplied_grid[5]
+    assert all(0 <= r < 10 and 0 <= c < 10 and (r, c) not in supplied_barriers
+               for r, c in supplied_visited), \
+        f"supplied-map route crossed a wall or left the grid: {supplied_visited}"
+    assert supplied_visited[-1] == (0, 9), \
+        f"supplied-map route must finish at J1 treasure, got {supplied_visited[-1]}"
+    expected_supplied_directions = ["right"] * 3 + ["up"] * 4 + ["right"] * 6
+    assert supplied_directions == expected_supplied_directions, \
+        f"supplied-map route must follow A5 -> D5 -> D1 -> J1 exactly: {supplied_directions}"
+    assert len(supplied_directions) <= MAX_ROUTE_DIRECTIONS, \
+        "supplied-map route must fit in one atomic model/game response"
+    assert (0, 6) in supplied_visited, \
+        "the direct supplied-map route should collect the G1 coin on its way to J1"
+
+    # The same atomic ceiling must apply to the shortest fallback itself.
+    # This valid corridor has one 53-step route; returning it would recreate
+    # the split-response failure, so the only safe atomic answer is no move.
+    serpentine_map = [
+        ["normal"] * 10,
+        ["wall"] * 9 + ["normal"],
+        ["normal"] * 10,
+        ["normal"] + ["wall"] * 9,
+        ["normal"] * 10,
+        ["wall"] * 9 + ["normal"],
+        ["normal"] * 10,
+        ["normal"] + ["wall"] * 9,
+        ["normal"] * 10,
+    ]
+    serpentine_map[0][0], serpentine_map[8][9] = "start", "treasure"
+    assert plan_path((0, 0), serpentine_map, hp_remaining=10) == [], \
+        "a 53-step direct fallback must not exceed the 48-direction atomic limit"
+
+    # A malformed/empty Bedrock call must return an explicit error and NO
+    # movement. It must never resurrect the fatal ["down", "right"]
+    # fallback (A5 -> A6 wall) that caused the reported immediate loss.
+    bad_event = {
+        "messageVersion": "1.0", "actionGroup": "PathfindingLambdaTarget",
+        "function": "plan_path", "parameters": [],
+    }
+    bad_response = lambda_handler(bad_event, None)
+    bad_body = json.loads(
+        bad_response["response"]["functionResponse"]["responseBody"]["TEXT"]["body"]
+    )
+    assert bad_body["directions"] == [] and bad_body.get("error"), bad_body
+
+    print("OK: all self-checks passed, including exact supplied map + Bedrock transport")
