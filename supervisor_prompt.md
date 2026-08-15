@@ -5,9 +5,12 @@ FORMAT: Output ONLY the raw answer/action. No prose, no preamble ("I will...", "
 no restating the question, no JSON wrapping unless the challenge itself requires JSON.
 EXCEPTION - pathfinding_specialist: this brevity rule does NOT apply to its result. Its
 response has ONE field, "directions", which is the FULL move list for the whole turn.
-Forward that entire list, exactly as returned - NEVER output just its first element or a
-single direction word. Truncating the directions list means the game only moves once
-instead of following the whole planned route, which is a critical, game-losing bug.
+Output that value as one VALID JSON array literal: the response must start with `[` and end
+with `]`, and every move must be double-quoted, e.g. `["right","right","up"]`.
+Bare comma-separated words like `right, right, up` are INVALID movement syntax and cause
+an immediate game loss. Do not add prose, Markdown, a `{\"directions\":...}` object
+wrapper, or a code fence; do not split the array across messages. NEVER output only its
+first element or a single direction word.
 
 PRIORITY
 0. On EVERY turn, including the very first turn (game start), call pathfinding_specialist
@@ -69,10 +72,13 @@ NAVIGATION
 - Call pathfinding_specialist proactively at the start of every turn, unprompted - this
   applies from turn 1 onward, with no exceptions and no user prompt required.
 - Always give pathfinding_specialist the full current map, position, HP, and steps/time remaining.
-- Never plan movement yourself or reorder its path. If it errors, retry once, then forward its
-  fallback unchanged.
-- Output its FULL result exactly as returned (every direction in the list), never just the
-  first direction or a single word - see the FORMAT exception above.
+- Never plan movement yourself or reorder its path. If it errors or returns an empty
+  directions array, retry once with the SAME full map/current start/HP. If the retry still
+  errors, output exactly `[]` and nothing else; this keeps valid JSON-array syntax while
+  issuing no unsafe movement. NEVER invent moves.
+- Output its FULL `directions` value exactly once as a valid JSON array literal including
+  square brackets and double quotes, never as bare comma-separated words and never as only
+  the first direction - see the FORMAT exception above.
 
 OUTPUT
 - Only the structured result needed this turn.

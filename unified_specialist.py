@@ -395,6 +395,14 @@ CHALLENGE_HP_COST = 0
 
 DEFAULT_STEP_COST = 3
 
+# Keep one movement reply below the game's/model's single-message output
+# ceiling. The supplied long route was visibly split into two chat
+# bubbles; the game consumed the incomplete first fragment and ended while
+# the agent was still at A5. ponytail: this prioritizes a guaranteed safe
+# route to treasure over optional score once a route exceeds 48 moves;
+# upgrade to paged/stateful movement when the game supports route chunks.
+MAX_ROUTE_DIRECTIONS = 48
+
 # Tile types that must ALWAYS be visited when safely reachable, regardless
 # of whether the profit-maximizing selection thinks it's "worth" the
 # detour. Doors/keys are deliberately NOT forced — the score-vs-cost
@@ -1057,7 +1065,26 @@ def plan_path(start, game_map, hp_remaining=5, step_cost=DEFAULT_STEP_COST, visi
 
     branches.sort(key=lambda b: b[0], reverse=True)
     _, best_seg = branches[0]
-    return _path_to_directions(best_seg)
+    directions = _path_to_directions(best_seg)
+    if len(directions) <= MAX_ROUTE_DIRECTIONS:
+        return directions
+
+    # Never return a truncated route: the omitted tail would strand the
+    # agent. Use the existing hazard-aware shortest path to treasure so
+    # the entire atomic response stays below the output ceiling.
+    direct_path, direct_hp_cost = _find_path(
+        start, treasure, rows, cols, barriers, dangers, doors_all,
+        door_color, frozenset(base_held),
+    )
+    direct_moves = len(direct_path) - 1 if direct_path else 0
+    if (direct_path is None or direct_hp_cost >= hp_remaining or
+            direct_moves > MAX_ROUTE_DIRECTIONS):
+        logger.error("no atomic safe route: direct route has %d moves (limit %d)",
+                     direct_moves, MAX_ROUTE_DIRECTIONS)
+        return []
+    logger.warning("optimized route has %d moves (limit %d); using %d-move safe treasure route",
+                   len(directions), MAX_ROUTE_DIRECTIONS, direct_moves)
+    return _path_to_directions(direct_path)
 
 
 def _coerce_number(value, default, field_name=""):
@@ -1075,12 +1102,15 @@ def _coerce_number(value, default, field_name=""):
 
 
 def _run_plan_path(body):
-    """Returns (result_dict, http_status_code)."""
+    """Returns (result_dict, http_status_code) without inventing moves."""
     try:
         game_map = body.get("map", body.get("game_map", body.get("grid", [])))
-        if game_map:
-            max_cols = max(len(row) for row in game_map)
-            game_map = [row + ["normal"] * (max_cols - len(row)) for row in game_map]
+        if not isinstance(game_map, list) or not game_map:
+            return {"directions": [], "error": "Missing non-empty map/game_map/grid."}, 400
+        if not all(isinstance(row, list) for row in game_map):
+            return {"directions": [], "error": "Map rows must be arrays."}, 400
+        max_cols = max(len(row) for row in game_map)
+        game_map = [row + ["normal"] * (max_cols - len(row)) for row in game_map]
         start_raw = body.get("start", body.get("start_pos", body.get("position",
                     body.get("current_position", body.get("agent_position", "A1")))))
         start = _parse_start(start_raw)
@@ -1094,14 +1124,17 @@ def _run_plan_path(body):
         held_keys = frozenset(c.lower() for c in held_keys_raw)
         directions = plan_path(start, game_map, hp_remaining=hp, step_cost=step_cost, visited=visited, held_keys=held_keys)
         if not directions:
-            directions = ["down", "right"]
-        # IMPORTANT: only ever return ONE field for the move list, named
-        # "directions". Do not re-add an "action"/"first_step" single-value
-        # field here — that previously caused the agent to forward only
-        # the first move per turn instead of the whole route.
+            return {"directions": [], "error": "No safe route found; no movement was issued."}, 422
+        # IMPORTANT: only ever return ONE move-list field. Do not add an
+        # action/first_step/path alias: those previously made the model
+        # forward a partial route instead of the complete JSON array.
         return {"directions": directions}, 200
-    except Exception as e:
-        return {"directions": ["down", "right", "down", "right"], "message": f"Fallback mode: {str(e)}"}, 200
+    except Exception as exc:
+        logger.exception("plan_path failed")
+        # Never emit a made-up movement fallback. The old fallback began
+        # with "down"; from the supplied A5 start, A6 is a wall, turning
+        # any recoverable tool error into an immediate guaranteed loss.
+        return {"directions": [], "error": f"plan_path failed: {exc}"}, 500
 
 
 # ============================================================================
@@ -1529,7 +1562,55 @@ result = "-".join(str(ord(ch.upper()) - ord('A') + 1) for ch in code if ch.isalp
         f"route walked through a 'brick' wall: {v12}"
     assert v12[-1] == (2, 2), "must still reach the treasure around the wall"
 
-    print("OK: plan_path self-checks passed (12)")
+    # Exact 10x10 layout from the supplied screenshot. The full score-
+    # maximizing route is 91 moves in this implementation and was visibly
+    # split into two game chat bubbles. The second fragment began with a
+    # comma, so the game rejected both and the agent never left A5.
+    supplied_map = [
+        ["c42", "c5", "normal", "normal", "c1", "normal", "c7", "normal", "normal", "treasure"],
+        ["c17", "normal", "normal", "c4", "wall", "normal", "normal", "normal", "normal", "normal"],
+        ["normal", "normal", "normal", "normal", "wall", "c43", "normal", "normal", "normal", "normal"],
+        ["wall", "wall", "wall", "c2", "wall", "wall", "c8", "wall", "wall", "c33"],
+        ["start", "normal", "normal", "normal", "c8", "normal", "normal", "normal", "normal", "normal"],
+        ["wall", "wall", "wall", "c8", "wall", "wall", "wall", "wall", "wall", "c32"],
+        ["c8", "normal", "normal", "normal", "wall", "c7", "c7", "c7", "c7", "c1"],
+        ["c4", "normal", "normal", "c17", "wall", "c5", "c7", "c7", "c7", "c7"],
+        ["normal", "normal", "normal", "normal", "wall", "wall", "wall", "wall", "wall", "normal"],
+        ["c8", "normal", "normal", "c5", "c2", "c7", "c7", "c7", "c7", "c7"],
+    ]
+    supplied_result, supplied_status = _run_plan_path({
+        "map": supplied_map, "start_pos": {"row": 4, "col": 0}, "hp": 5,
+    })
+    expected_supplied_directions = ["right"] * 3 + ["up"] * 4 + ["right"] * 6
+    assert supplied_status == 200 and supplied_result["directions"] == expected_supplied_directions, \
+        f"supplied map must follow A5 -> D5 -> D1 -> J1 in one response: {supplied_result}"
+    supplied_visited = _walk((4, 0), supplied_result["directions"])
+    supplied_barriers = _build_grid(supplied_map)[3]
+    assert supplied_visited[-1] == (0, 9) and not (set(supplied_visited) & supplied_barriers), \
+        f"supplied-map route must end at J1 without crossing a wall: {supplied_visited}"
+
+    # Reject an overlong shortest fallback too. This corridor has only one
+    # 53-step path, which cannot fit the game's 48-direction atomic reply.
+    serpentine_map = [
+        ["normal"] * 10,
+        ["wall"] * 9 + ["normal"],
+        ["normal"] * 10,
+        ["normal"] + ["wall"] * 9,
+        ["normal"] * 10,
+        ["wall"] * 9 + ["normal"],
+        ["normal"] * 10,
+        ["normal"] + ["wall"] * 9,
+        ["normal"] * 10,
+    ]
+    serpentine_map[0][0], serpentine_map[8][9] = "start", "treasure"
+    assert plan_path((0, 0), serpentine_map, hp_remaining=10, step_cost=1) == [], \
+        "a 53-step direct fallback must not exceed the 48-direction atomic limit"
+
+    no_map_result, no_map_status = _run_plan_path({})
+    assert no_map_status == 400 and no_map_result["directions"] == [] and no_map_result.get("error"), \
+        "missing input must return an error with no movement, never the fatal down/right fallback"
+
+    print("OK: plan_path self-checks passed (15, including exact supplied map)")
 
     # ---- unified dispatch self-checks: "plain" testing shape ----
     resp_c = lambda_handler({"action": "execute_code", "code": "result = 6 * 7"}, None)
@@ -1644,4 +1725,4 @@ result = "-".join(str(ord(ch.upper()) - ord('A') + 1) for ch in code if ch.isalp
     assert resp_garbage["statusCode"] == 400, resp_garbage
 
     print("OK: unrecognized-event safety check passed (1)")
-    print("ALL SELF-CHECKS PASSED (37 total)")
+    print("ALL SELF-CHECKS PASSED (40 total)")

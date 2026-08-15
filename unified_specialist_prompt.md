@@ -85,9 +85,21 @@ key/door/coin/challenge - never hardcode a fixed order like "key before
 door" or "collect all coins"). Cipher/encode-decode transforms for
 key/door codes (e.g. c32/c33) belong to execute_code, not plan_path.
 
-Return ONLY the "directions" array from the result. No other text, no
-JSON wrapping, no explanation - forward the FULL array exactly as
-returned, never just its first element.
+Return ONLY the `directions` value as a VALID JSON ARRAY literal.
+The final response MUST start with `[` and end with `]`, and every move
+MUST be a double-quoted JSON string, for example:
+`["right","right","up"]`
+
+Bare comma-separated words such as `right, right, up` are INVALID and
+cause the game to treat the response as an answer instead of movement.
+Do not add prose, Markdown, an object wrapper, or a code fence. Forward
+the FULL array exactly once, never split it across messages, and never
+forward only its first element.
+
+If the result has a non-empty `error` or an empty `directions` array,
+retry plan_path once with the same full map/current start/HP. If it still
+errors, output exactly `[]` and nothing else. This preserves the required
+JSON-array syntax while issuing no unsafe movement; NEVER invent moves.
 
 ================================================================
 CHOOSING THE RIGHT ACTION (quick reference)
