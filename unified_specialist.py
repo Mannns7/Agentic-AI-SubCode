@@ -415,8 +415,59 @@ def _tile_score(cell_lower):
     return 0
 
 
+# Labels a game map may use for an IMPASSABLE tile. Only the exact string
+# "wall" used to be recognized here - any other spelling silently became a
+# walkable "normal" tile, so a planned route could run straight THROUGH a
+# wall. The game then refuses that move, and every direction after it is
+# applied from the wrong tile: the classic "pressed start and immediately
+# walked into a wall" symptom, where the whole turn's route is desynced.
+WALL_LABELS = {"wall", "walls", "barrier", "barriers", "brick", "bricks",
+               "block", "blocked", "rock", "stone", "obstacle", "impassable",
+               "solid", "#", "x"}
+
+# Labels marking the agent's own tile on the map. Used ONLY as a fallback
+# when the caller-supplied start position turns out to be unusable.
+START_LABELS = {"start", "agent", "player", "hero", "spawn"}
+
+# Dict-key spellings the game has used for a structured position.
+_START_ROW_KEYS = ("row", "rows", "r", "y", "line")
+_START_COL_KEYS = ("col", "cols", "column", "c", "x")
+_START_NESTED_KEYS = ("position", "pos", "start", "start_pos", "cell", "coord",
+                      "coords", "coordinates", "location", "current_position",
+                      "agent_position")
+
+
 def _parse_start(pos):
+    """
+    Parse a position from every shape the game has actually sent.
+
+    A dict position used to fall through to a regex over str(dict), which
+    produced silently WRONG coordinates instead of failing loudly - e.g.
+    {"x": 1, "y": 5} stringifies to "x1y5", the regex read "x1" as
+    "column X, row 1" and returned column 23 on a 10-column map. Planning
+    from a bogus origin desyncs every move that follows, so dict input is
+    now destructured by key name instead of by accident.
+    """
     try:
+        if isinstance(pos, dict):
+            # a nested {"position": "A5"} style wrapper
+            for k, v in pos.items():
+                if str(k).strip().lower() in _START_NESTED_KEYS:
+                    return _parse_start(v)
+            row_val = col_val = None
+            for k, v in pos.items():
+                kl = str(k).strip().lower()
+                if kl in _START_ROW_KEYS and row_val is None:
+                    row_val = v
+                elif kl in _START_COL_KEYS and col_val is None:
+                    col_val = v
+            if row_val is not None and col_val is not None:
+                rs = re.sub(r"[^A-Za-z0-9]", "", str(row_val))
+                cs = re.sub(r"[^A-Za-z0-9]", "", str(col_val))
+                if cs.isalpha():  # e.g. {"row": 5, "col": "A"} -> A5
+                    return (int(rs) - 1, ord(cs[0].upper()) - ord('A'))
+                return (int(rs), int(cs))
+            return (0, 0)
         if isinstance(pos, (list, tuple)):
             if len(pos) == 1:
                 return _parse_start(pos[0])
@@ -429,7 +480,7 @@ def _parse_start(pos):
                     return (int(a) - 1, ord(b.upper()) - ord('A'))
                 return (int(a), int(b))
         s = re.sub(r"[^A-Za-z0-9]", "", str(pos))
-        m = re.match(r"([A-Za-z])(\d+)", s)
+        m = re.match(r"([A-Za-z])(\d+)$", s)
         if m:
             return (int(m.group(2)) - 1, ord(m.group(1).upper()) - ord('A'))
         nums = re.findall(r"\d+", s)
@@ -438,6 +489,50 @@ def _parse_start(pos):
     except (ValueError, TypeError, IndexError):
         pass
     return (0, 0)
+
+
+def _resolve_start(start, rows, cols, barriers, grid):
+    """
+    Calibrate the parsed start position against the REAL grid.
+
+    The game has sent this field in several shapes and indexings over time
+    ("A5", [4, 0], {"row": 5, "col": 1}, ...), so a parsed position that
+    lands outside the map or on top of a wall is definitely wrong - and
+    planning from a wrong origin makes the agent walk into a wall on its
+    very first step, desyncing the entire turn. When that happens, prefer
+    (in order): the map's own start/agent tile, the common off-by-one
+    (1-indexed) readings, then a clamp back into bounds.
+    """
+    def _ok(p):
+        return 0 <= p[0] < rows and 0 <= p[1] < cols and p not in barriers
+
+    if _ok(start):
+        return start
+
+    for pos, label in grid.items():
+        if label in START_LABELS and _ok(pos):
+            logger.warning(f"start {start} is out of bounds or inside a wall; "
+                           f"using the map's own start tile {pos} instead")
+            return pos
+
+    r, c = start
+    for cand in ((r - 1, c - 1), (r - 1, c), (r, c - 1)):
+        if _ok(cand):
+            logger.warning(f"start {start} is unusable; using off-by-one "
+                           f"(1-indexed) reading {cand} instead")
+            return cand
+
+    clamped = (min(max(r, 0), max(rows - 1, 0)), min(max(c, 0), max(cols - 1, 0)))
+    if _ok(clamped):
+        logger.warning(f"start {start} is unusable; clamped to {clamped}")
+        return clamped
+
+    for pos in grid:
+        if _ok(pos):
+            logger.warning(f"start {start} is unusable; falling back to first "
+                           f"walkable tile {pos}")
+            return pos
+    return start
 
 
 def _parse_cell_pos(cell_pos_str):
@@ -474,10 +569,10 @@ def _build_grid(game_map, visited=None):
     for r, row_data in enumerate(game_map):
         for c, cell in enumerate(row_data):
             cell_lower = str(cell).lower().strip() if cell else ""
-            if (r, c) in visited_set and cell_lower not in ("wall", "treasure"):
+            if (r, c) in visited_set and cell_lower not in WALL_LABELS and cell_lower != "treasure":
                 cell_lower = "normal"  # already collected — no value left here
             grid[(r, c)] = cell_lower
-            if cell_lower == "wall":
+            if cell_lower in WALL_LABELS:
                 barriers.add((r, c))
             elif cell_lower == "c8":
                 dangers.add((r, c))
@@ -876,6 +971,10 @@ def plan_path(start, game_map, hp_remaining=5, step_cost=DEFAULT_STEP_COST, visi
     """
     (grid, rows, cols, barriers, dangers, coins, challenges,
      key_positions, door_positions, door_color, treasure) = _build_grid(game_map, visited=visited)
+
+    # Calibrate the start against the real grid BEFORE planning anything -
+    # a start inside a wall/off the map makes every subsequent move wrong.
+    start = _resolve_start(start, rows, cols, barriers, grid)
 
     if treasure is None:
         treasure = (rows - 1, cols - 1)
@@ -1388,7 +1487,49 @@ result = "-".join(str(ord(ch.upper()) - ord('A') + 1) for ch in code if ch.isalp
     assert status_b == 200 and r_b["directions"] != ["down", "right", "down", "right"], \
         "a bad non-numeric step_cost must not crash into the generic hardcoded fallback"
 
-    print("OK: plan_path self-checks passed (9)")
+    # A dict position must be destructured BY KEY, not by a regex over
+    # str(dict). {"x": 1, "y": 5} used to stringify to "x1y5", get read as
+    # "column X, row 1", and return column 23 on a 10-column map -
+    # planning from that bogus origin desyncs every move after it.
+    assert _parse_start({"row": 5, "col": "A"}) == (4, 0), _parse_start({"row": 5, "col": "A"})
+    assert _parse_start({"position": "A5"}) == (4, 0), _parse_start({"position": "A5"})
+    r_xy, c_xy = _parse_start({"x": 1, "y": 5})
+    assert 0 <= c_xy < 10, f"dict position produced an out-of-range column: {(r_xy, c_xy)}"
+    assert _parse_start("A5") == (4, 0), "the plain 'A5' form must keep working"
+
+    # A start that lands inside a wall (wrong indexing from the caller)
+    # must be calibrated back onto a real walkable tile, or the agent walks
+    # into a wall on its very first step.
+    walled_map = [
+        ["wall", "wall", "wall"],
+        ["wall", "start", "normal"],
+        ["wall", "normal", "treasure"],
+    ]
+    g11 = _build_grid(walled_map)
+    grid11, rows11, cols11, barriers11 = g11[0], g11[1], g11[2], g11[3]
+    assert _resolve_start((0, 0), rows11, cols11, barriers11, grid11) == (1, 1), \
+        "a start inside a wall must fall back to the map's own start tile"
+    assert _resolve_start((99, 99), rows11, cols11, barriers11, grid11) == (1, 1), \
+        "a start off the map must fall back to the map's own start tile"
+    assert _resolve_start((1, 2), rows11, cols11, barriers11, grid11) == (1, 2), \
+        "a start that IS valid must be trusted as-is (agent isn't on the start tile after turn 1)"
+
+    # Walls labelled with anything other than the exact string "wall" must
+    # still be impassable. Previously "brick" fell through to a walkable
+    # "normal" tile, so the planner routed straight through it and the game
+    # rejected the move mid-route.
+    brick_map = [
+        ["start", "brick", "normal"],
+        ["normal", "brick", "normal"],
+        ["normal", "normal", "treasure"],
+    ]
+    d12 = plan_path((0, 0), brick_map, hp_remaining=10, step_cost=1)
+    v12 = _walk((0, 0), d12)
+    assert (0, 1) not in v12 and (1, 1) not in v12, \
+        f"route walked through a 'brick' wall: {v12}"
+    assert v12[-1] == (2, 2), "must still reach the treasure around the wall"
+
+    print("OK: plan_path self-checks passed (12)")
 
     # ---- unified dispatch self-checks: "plain" testing shape ----
     resp_c = lambda_handler({"action": "execute_code", "code": "result = 6 * 7"}, None)
@@ -1503,4 +1644,4 @@ result = "-".join(str(ord(ch.upper()) - ord('A') + 1) for ch in code if ch.isalp
     assert resp_garbage["statusCode"] == 400, resp_garbage
 
     print("OK: unrecognized-event safety check passed (1)")
-    print("ALL SELF-CHECKS PASSED (34 total)")
+    print("ALL SELF-CHECKS PASSED (37 total)")
