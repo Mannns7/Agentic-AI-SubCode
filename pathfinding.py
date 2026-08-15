@@ -470,6 +470,46 @@ def _or_opt(route, dist_matrix, max_passes=6):
     return route
 
 
+def _route_moves(route, dist_matrix):
+    """Total moves the route costs, or inf if any leg is unreachable."""
+    total = 0
+    for a, b in zip(route, route[1:]):
+        d = dist_matrix[a][b]
+        if d == float('inf'):
+            return float('inf')
+        total += d
+    return total
+
+
+def _trim_to_move_budget(route, dist_matrix, scores, first_optional_idx, budget):
+    """
+    Drop the least valuable stops until the route fits in `budget` moves.
+
+    Without this, a route over the atomic output limit was discarded
+    WHOLESALE for a straight run to the treasure, so on a dense map the
+    agent collected NOTHING. Trimming keeps the best-paying stops that fit.
+    Optional stops go first, worst value-per-move saved first; forced quest
+    tiles are only sacrificed once nothing optional is left.
+    """
+    while len(route) > 2 and _route_moves(route, dist_matrix) > budget:
+        optional = [i for i in range(1, len(route) - 1) if route[i] >= first_optional_idx]
+        removable = optional or list(range(1, len(route) - 1))
+        worst_pos, worst_ratio = None, None
+        for i in removable:
+            trial = route[:i] + route[i + 1:]
+            saved = _route_moves(route, dist_matrix) - _route_moves(trial, dist_matrix)
+            if saved <= 0:
+                worst_pos, worst_ratio = i, -1.0  # pure dead weight
+                break
+            ratio = scores.get(route[i], 0) / saved
+            if worst_ratio is None or ratio < worst_ratio:
+                worst_pos, worst_ratio = i, ratio
+        if worst_pos is None:
+            break
+        route = route[:worst_pos] + route[worst_pos + 1:]
+    return route
+
+
 def _cheapest_insertion(route_indices, dist_matrix, candidate_idx):
     best_pos, best_extra = None, float('inf')
     for i in range(len(route_indices) - 1):
@@ -564,14 +604,27 @@ def _plan_collect(current_pos, coins, challenges, treasure, rows, cols, barriers
     else:
         route = [0, treasure_idx]
 
-    optional_sorted = sorted(optional_idx, key=lambda i: -scores[i])
-    for cand in optional_sorted:
-        pos, extra = _cheapest_insertion(route, dist_matrix, cand)
-        if pos is None:
-            continue
-        net_gain = scores[cand] - step_cost * extra
-        if net_gain <= 0:
-            continue
+    # True greedy insertion: re-price EVERY remaining candidate each round
+    # and take the single best ACTUAL profit (score minus the real detour).
+    # Sorting by raw score once committed to a far-away high scorer before a
+    # near-identical one right next to the path, and every later insertion
+    # had to detour around that bad commitment - the compounding zigzag.
+    remaining = set(optional_idx)
+    while remaining:
+        best = None
+        for cand in remaining:
+            pos, extra = _cheapest_insertion(route, dist_matrix, cand)
+            if pos is None or extra == float('inf'):
+                continue
+            net_gain = scores[cand] - step_cost * extra
+            if net_gain <= 0:
+                continue
+            if best is None or (net_gain, -extra) > (best[0], -best[1]):
+                best = (net_gain, extra, pos, cand)
+        if best is None:
+            break
+        _, _, pos, cand = best
+        remaining.discard(cand)
         trial_route = route[:pos] + [cand] + route[pos:]
         if _route_hp_feasible(trial_route, waypoints, simulated_hp, rows, cols, barriers, dangers, door_map, held_keys, challenges, treasure=treasure):
             route = trial_route
@@ -583,6 +636,12 @@ def _plan_collect(current_pos, coins, challenges, treasure, rows, cols, barriers
     cleaned_route2 = _or_opt(list(route), dist_matrix)
     if cleaned_route2 != route and _route_hp_feasible(cleaned_route2, waypoints, simulated_hp, rows, cols, barriers, dangers, door_map, held_keys, challenges, treasure=treasure):
         route = cleaned_route2
+
+    # Keep the whole turn inside ONE atomic reply. Trimming the cheapest
+    # stops beats handing back a route the game splits and rejects - and
+    # beats throwing the entire route away for an empty run to the treasure.
+    route = _trim_to_move_budget(route, dist_matrix, scores,
+                                 1 + len(forced_targets), MAX_ROUTE_DIRECTIONS)
 
     seg_path = []
     hp_left = simulated_hp
@@ -1203,6 +1262,36 @@ if __name__ == "__main__":
     d7 = plan_path((0, 0), challenge_corridor, hp_remaining=5)
     assert d7 == ["right"] * 6, \
         f"a plain challenge corridor must still be walked, got {d7}"
+
+    # DENSE MAP (>15 collectibles) - the case none of the earlier checks
+    # covered. A board packed with value used to produce a 100+ move route
+    # that blew the atomic limit, so the whole thing was thrown away for a
+    # bare run to the treasure and the agent collected almost nothing.
+    # It must now come back UNDER the limit and still collect real score.
+    dense_map = [["c7"] * 10 for _ in range(10)]
+    dense_map[0][0], dense_map[9][9] = "start", "treasure"
+    g_dense = _build_grid(dense_map)
+    dense_coins, dense_barriers, dense_treasure = g_dense[5], g_dense[3], g_dense[9]
+    assert len(dense_coins) > 15, "this regression only bites when >15 tiles are worth taking"
+    d8 = plan_path((0, 0), dense_map, hp_remaining=5, step_cost=1)
+    v8 = _walk((0, 0), d8)
+    assert d8, "a dense map must still produce movement"
+    assert len(d8) <= MAX_ROUTE_DIRECTIONS, \
+        f"dense route must fit one atomic reply, got {len(d8)} moves"
+    assert v8[-1] == dense_treasure, f"dense route must end at the treasure: {v8[-1]}"
+    assert not (set(v8) & dense_barriers), "dense route must never cross a wall"
+    # A bare beeline is 18 moves and picks up ~17 coins purely by accident;
+    # trimming a real scoring route must beat that by a wide margin.
+    dense_collected = len(set(v8) & dense_coins)
+    assert dense_collected >= 25, \
+        f"dense route should still collect real score, only got {dense_collected} coins"
+
+    # Trimming itself: an over-budget route must be shortened, not emptied.
+    trim_dist = [[0, 2, 30, 4], [2, 0, 30, 4], [30, 30, 0, 30], [4, 4, 30, 0]]
+    trim_scores = {0: 0, 1: 250, 2: 250, 3: 0}
+    trimmed = _trim_to_move_budget([0, 1, 2, 3], trim_dist, trim_scores, 1, budget=10)
+    assert trimmed == [0, 1, 3], \
+        f"trim must drop only the far stop and keep the cheap one: {trimmed}"
 
     # A malformed/empty Bedrock call must return an explicit error and NO
     # movement. It must never resurrect the fatal ["down", "right"]
