@@ -668,7 +668,23 @@ def _hp_cost_of_path(path, dangers, doors_all, door_color, held_keys):
     return cost
 
 
-def _find_path(start, goal, rows, cols, barriers, dangers, doors_all, door_color, held_keys):
+def _effective_barriers(barriers, treasure, goal):
+    """
+    Block the treasure tile unless it IS the goal.
+
+    Stepping onto the treasure ENDS the run, so it can never be an
+    incidental waypoint. Without this, path costs are computed through the
+    treasure, the optimizer picks an order that "passes through" it, and the
+    route that comes out doubles back on itself - the zigzag reported from
+    live play on dense maps.
+    """
+    if treasure is not None and treasure != goal:
+        return barriers | {treasure}
+    return barriers
+
+
+def _find_path(start, goal, rows, cols, barriers, dangers, doors_all, door_color, held_keys, treasure=None):
+    barriers = _effective_barriers(barriers, treasure, goal)
     hazards = set(dangers) | _locked_doors(doors_all, door_color, held_keys)
     safe_path = _bfs_simple(start, goal, rows, cols, barriers | hazards)
     if safe_path is not None:
@@ -679,7 +695,8 @@ def _find_path(start, goal, rows, cols, barriers, dangers, doors_all, door_color
     return path, _hp_cost_of_path(path, dangers, doors_all, door_color, held_keys)
 
 
-def _is_reachable(start, goal, rows, cols, barriers):
+def _is_reachable(start, goal, rows, cols, barriers, treasure=None):
+    barriers = _effective_barriers(barriers, treasure, goal)
     return _bfs_simple(start, goal, rows, cols, barriers) is not None
 
 
@@ -793,11 +810,108 @@ def _two_opt(route, dist_matrix, max_passes=8):
     return route
 
 
-def _route_hp_feasible(route, waypoints, hp_start, rows, cols, barriers, dangers, doors_all, door_color, held_keys, challenges):
+def _or_opt(route, dist_matrix, max_passes=8):
+    """
+    Relocate a single stop to a cheaper place in the route.
+
+    2-opt can only REVERSE a run, so it cannot fix "this one tile is
+    visited from the wrong side of the map" - the exact shape of the
+    reported zigzag. Moving one stop at a time does fix it.
+    """
+    n = len(route)
+    if n < 4:
+        return route
+    for _ in range(max_passes):
+        improved = False
+        for i in range(1, n - 1):
+            node = route[i]
+            prev_n, next_n = route[i - 1], route[i + 1]
+            d_prev_node = dist_matrix[prev_n][node]
+            d_node_next = dist_matrix[node][next_n]
+            d_prev_next = dist_matrix[prev_n][next_n]
+            if float('inf') in (d_prev_node, d_node_next, d_prev_next):
+                continue
+            removed_cost = d_prev_node + d_node_next - d_prev_next
+            if removed_cost <= 1e-9:
+                continue
+            trial = route[:i] + route[i + 1:]
+            pos, extra = _cheapest_insertion(trial, dist_matrix, node)
+            if pos is not None and extra < removed_cost - 1e-9:
+                trial.insert(pos, node)
+                route = trial
+                improved = True
+                break
+        if not improved:
+            break
+    return route
+
+
+def _route_moves(route, dist_matrix):
+    """Total moves the route costs, or inf if any leg is unreachable."""
+    total = 0
+    for a, b in zip(route, route[1:]):
+        d = dist_matrix[a][b]
+        if d == float('inf'):
+            return float('inf')
+        total += d
+    return total
+
+
+def _trim_to_move_budget(route, dist_matrix, scores, first_optional_idx, budget):
+    """
+    Drop the least valuable stops until the route fits in `budget` moves.
+
+    Without this, a route that overshoots the atomic output limit was thrown
+    away WHOLESALE and replaced by a straight run to the treasure - so on a
+    dense map the agent collected NOTHING. Trimming keeps the best-paying
+    stops that still fit, which is worth far more than an empty beeline.
+
+    Optional stops go first, cheapest-value-per-move first; forced quest
+    tiles are only sacrificed once nothing optional is left.
+    """
+    while len(route) > 2 and _route_moves(route, dist_matrix) > budget:
+        optional = [i for i in range(1, len(route) - 1) if route[i] >= first_optional_idx]
+        removable = optional or list(range(1, len(route) - 1))
+        worst_pos, worst_ratio = None, None
+        for i in removable:
+            trial = route[:i] + route[i + 1:]
+            saved = _route_moves(route, dist_matrix) - _route_moves(trial, dist_matrix)
+            if saved <= 0:
+                # Removing it saves nothing, so it is pure dead weight.
+                worst_pos, worst_ratio = i, -1.0
+                break
+            ratio = scores.get(route[i], 0) / saved
+            if worst_ratio is None or ratio < worst_ratio:
+                worst_pos, worst_ratio = i, ratio
+        if worst_pos is None:
+            break
+        route = route[:worst_pos] + route[worst_pos + 1:]
+    return route
+
+
+def _local_search(route, dist_matrix, max_rounds=6):
+    """
+    Alternate 2-opt and or-opt until neither can improve the route.
+
+    Running 2-opt once (the old behaviour) leaves crossings that only
+    appear AFTER a relocation, and vice versa, so a single pass of either
+    stops well short of what the pair can reach together.
+    """
+    route = list(route)
+    for _ in range(max_rounds):
+        before = list(route)
+        route = _two_opt(route, dist_matrix)
+        route = _or_opt(route, dist_matrix)
+        if route == before:
+            break
+    return route
+
+
+def _route_hp_feasible(route, waypoints, hp_start, rows, cols, barriers, dangers, doors_all, door_color, held_keys, challenges, treasure=None):
     hp_left = hp_start
     cur = route[0]
     for nxt in route[1:]:
-        path, hp_cost = _find_path(waypoints[cur], waypoints[nxt], rows, cols, barriers, dangers, doors_all, door_color, held_keys)
+        path, hp_cost = _find_path(waypoints[cur], waypoints[nxt], rows, cols, barriers, dangers, doors_all, door_color, held_keys, treasure=treasure)
         if path is None:
             return False
         extra = CHALLENGE_HP_COST if waypoints[nxt] in challenges else 0
@@ -809,7 +923,7 @@ def _route_hp_feasible(route, waypoints, hp_start, rows, cols, barriers, dangers
     return True
 
 
-def _compute_pairwise_distances(waypoints, rows, cols, barriers, dangers, doors_all, door_color, held_keys):
+def _compute_pairwise_distances(waypoints, rows, cols, barriers, dangers, doors_all, door_color, held_keys, treasure=None):
     n = len(waypoints)
     dist = [[float('inf')] * n for _ in range(n)]
     for i in range(n):
@@ -817,7 +931,7 @@ def _compute_pairwise_distances(waypoints, rows, cols, barriers, dangers, doors_
             if i == j:
                 dist[i][j] = 0
                 continue
-            path, _ = _find_path(waypoints[i], waypoints[j], rows, cols, barriers, dangers, doors_all, door_color, held_keys)
+            path, _ = _find_path(waypoints[i], waypoints[j], rows, cols, barriers, dangers, doors_all, door_color, held_keys, treasure=treasure)
             dist[i][j] = len(path) - 1 if path else float('inf')
     return dist
 
@@ -838,7 +952,8 @@ def _path_to_directions(path):
 
 
 def _plan_collect(current_pos, coins, challenges, treasure, rows, cols, barriers, dangers,
-                   doors_all, door_color, held_keys, simulated_hp, step_cost, grid):
+                   doors_all, door_color, held_keys, simulated_hp, step_cost, grid,
+                   move_budget=MAX_ROUTE_DIRECTIONS):
     """
     Score-vs-cost optimizer over every collectible tile (coins, all
     challenge types, AND keys/doors). The Held-Karp/2-opt search decides
@@ -848,11 +963,11 @@ def _plan_collect(current_pos, coins, challenges, treasure, rows, cols, barriers
     collectibles = coins | challenges
     safe_targets, forced_targets = [], []
     for pos in collectibles:
-        if not _is_reachable(current_pos, pos, rows, cols, barriers):
+        if not _is_reachable(current_pos, pos, rows, cols, barriers, treasure=treasure):
             continue
-        if not _is_reachable(pos, treasure, rows, cols, barriers):
+        if not _is_reachable(pos, treasure, rows, cols, barriers, treasure=treasure):
             continue
-        path, hp_cost = _find_path(current_pos, pos, rows, cols, barriers, dangers, doors_all, door_color, held_keys)
+        path, hp_cost = _find_path(current_pos, pos, rows, cols, barriers, dangers, doors_all, door_color, held_keys, treasure=treasure)
         if path is None:
             continue
         extra = CHALLENGE_HP_COST if pos in challenges else 0
@@ -877,12 +992,12 @@ def _plan_collect(current_pos, coins, challenges, treasure, rows, cols, barriers
     scores = {i: _score_for(pos) for i, pos in enumerate(waypoints)}
 
     if not all_targets:
-        path, _ = _find_path(current_pos, treasure, rows, cols, barriers, dangers, doors_all, door_color, held_keys)
+        path, _ = _find_path(current_pos, treasure, rows, cols, barriers, dangers, doors_all, door_color, held_keys, treasure=treasure)
         if path is None:
             return None, None
         return path, -step_cost * (len(path) - 1)
 
-    dist_matrix = _compute_pairwise_distances(waypoints, rows, cols, barriers, dangers, doors_all, door_color, held_keys)
+    dist_matrix = _compute_pairwise_distances(waypoints, rows, cols, barriers, dangers, doors_all, door_color, held_keys, treasure=treasure)
     target_indices = list(range(1, treasure_idx))
     must_include = set(range(len(forced_targets)))
 
@@ -894,7 +1009,7 @@ def _plan_collect(current_pos, coins, challenges, treasure, rows, cols, barriers
                 order = _held_karp_order(dist_matrix, target_indices, treasure_idx, scores, step_cost, reduced_must)
             if order is None:
                 order = list(target_indices)
-        route = [0] + order + [treasure_idx]
+        route = _local_search([0] + order + [treasure_idx], dist_matrix)
     else:
         forced_idx = list(range(1, 1 + len(forced_targets)))
         optional_idx = list(range(1 + len(forced_targets), treasure_idx))
@@ -911,23 +1026,48 @@ def _plan_collect(current_pos, coins, challenges, treasure, rows, cols, barriers
         else:
             route = [0, treasure_idx]
 
-        optional_sorted = sorted(optional_idx, key=lambda i: -scores[i])
-        for cand in optional_sorted:
-            pos, extra = _cheapest_insertion(route, dist_matrix, cand)
-            if pos is None:
-                continue
-            net_gain = scores[cand] - step_cost * extra
-            if net_gain <= 0:
-                continue
+        # True greedy insertion: every round, re-price EVERY remaining
+        # candidate at its own cheapest position and take the single best
+        # ACTUAL profit (score minus the real detour it costs).
+        #
+        # The old loop sorted by raw score once and inserted in that order,
+        # so a 250-point coin on the far side of the map was committed to
+        # before a 250-point coin one step off the path, and every later
+        # insertion had to detour around that bad commitment. On a dense map
+        # (>15 collectibles, i.e. this round's board) that compounded into a
+        # 105-move route with 41% of its steps re-walking tiles.
+        remaining = set(optional_idx)
+        while remaining:
+            best = None
+            for cand in remaining:
+                pos, extra = _cheapest_insertion(route, dist_matrix, cand)
+                if pos is None or extra == float('inf'):
+                    continue
+                net_gain = scores[cand] - step_cost * extra
+                if net_gain <= 0:
+                    continue
+                # Prefer the biggest real profit; break ties on the smaller
+                # detour so the route stays tight.
+                if best is None or (net_gain, -extra) > (best[0], -best[1]):
+                    best = (net_gain, extra, pos, cand)
+            if best is None:
+                break
+            _, _, pos, cand = best
             trial_route = route[:pos] + [cand] + route[pos:]
-            if _route_hp_feasible(trial_route, waypoints, simulated_hp, rows, cols, barriers, dangers, doors_all, door_color, held_keys, challenges):
+            remaining.discard(cand)
+            if _route_hp_feasible(trial_route, waypoints, simulated_hp, rows, cols, barriers, dangers, doors_all, door_color, held_keys, challenges, treasure=treasure):
                 route = trial_route
 
-        route = _two_opt(route, dist_matrix)
+        route = _local_search(route, dist_matrix)
 
-    if not _route_hp_feasible(route, waypoints, simulated_hp, rows, cols, barriers, dangers, doors_all, door_color, held_keys, challenges):
-        route = _two_opt(list(route), dist_matrix)
-        while len(route) > 2 and not _route_hp_feasible(route, waypoints, simulated_hp, rows, cols, barriers, dangers, doors_all, door_color, held_keys, challenges):
+    # Keep the whole turn inside ONE atomic reply. Trimming the cheapest
+    # stops beats handing back a route the game will split and reject.
+    route = _trim_to_move_budget(route, dist_matrix, scores,
+                                 1 + len(forced_targets), move_budget)
+
+    if not _route_hp_feasible(route, waypoints, simulated_hp, rows, cols, barriers, dangers, doors_all, door_color, held_keys, challenges, treasure=treasure):
+        route = _local_search(route, dist_matrix)
+        while len(route) > 2 and not _route_hp_feasible(route, waypoints, simulated_hp, rows, cols, barriers, dangers, doors_all, door_color, held_keys, challenges, treasure=treasure):
             non_forced_positions = [i for i in range(1, len(route) - 1) if route[i] >= 1 + len(forced_targets)]
             candidates = non_forced_positions or list(range(1, len(route) - 1))
             worst_pos, worst_extra = None, -1
@@ -947,7 +1087,7 @@ def _plan_collect(current_pos, coins, challenges, treasure, rows, cols, barriers
     current_idx = 0
     for next_idx in route[1:]:
         pos = waypoints[next_idx]
-        path, hp_cost = _find_path(waypoints[current_idx], pos, rows, cols, barriers, dangers, doors_all, door_color, held_keys)
+        path, hp_cost = _find_path(waypoints[current_idx], pos, rows, cols, barriers, dangers, doors_all, door_color, held_keys, treasure=treasure)
         if path is None:
             continue
         extra = CHALLENGE_HP_COST if pos in challenges else 0
@@ -961,7 +1101,7 @@ def _plan_collect(current_pos, coins, challenges, treasure, rows, cols, barriers
         current_idx = next_idx
 
     if current_idx != treasure_idx:
-        path, _ = _find_path(waypoints[current_idx], treasure, rows, cols, barriers, dangers, doors_all, door_color, held_keys)
+        path, _ = _find_path(waypoints[current_idx], treasure, rows, cols, barriers, dangers, doors_all, door_color, held_keys, treasure=treasure)
         if path is None:
             return None, None
         seg_path.extend(path[1:] if seg_path else path)
@@ -1011,7 +1151,7 @@ def plan_path(start, game_map, hp_remaining=5, step_cost=DEFAULT_STEP_COST, visi
             key_targets = []
             for color in chosen:
                 candidates = list(key_positions[color])
-                candidates = [p for p in candidates if _is_reachable(cur_pos, p, rows, cols, barriers)]
+                candidates = [p for p in candidates if _is_reachable(cur_pos, p, rows, cols, barriers, treasure=treasure)]
                 if not candidates:
                     feasible = False
                     break
@@ -1029,7 +1169,7 @@ def plan_path(start, game_map, hp_remaining=5, step_cost=DEFAULT_STEP_COST, visi
                     color, candidates = key_targets[idx]
                     best_c, best_leg, best_leg_cost = None, None, float('inf')
                     for cand in candidates:
-                        leg, hp_cost = _find_path(p_pos, cand, rows, cols, barriers, dangers, doors_all, door_color, frozenset(held_acc))
+                        leg, hp_cost = _find_path(p_pos, cand, rows, cols, barriers, dangers, doors_all, door_color, frozenset(held_acc), treasure=treasure)
                         if leg is None:
                             continue
                         if hp_cost < best_leg_cost:
@@ -1052,8 +1192,11 @@ def plan_path(start, game_map, hp_remaining=5, step_cost=DEFAULT_STEP_COST, visi
                 continue
             prefix_path, prefix_cost, cur_pos, hp_budget = best_perm_path, best_perm_cost, best_perm_pos, best_perm_hp
 
+        # The key-collection prefix is already spent, so the collect phase
+        # only gets what is LEFT of the one-reply move budget.
         seg, net = _plan_collect(cur_pos, coins, challenges, treasure, rows, cols, barriers, dangers,
-                                  doors_all, door_color, held_now, hp_budget, step_cost, grid)
+                                  doors_all, door_color, held_now, hp_budget, step_cost, grid,
+                                  move_budget=MAX_ROUTE_DIRECTIONS - len(prefix_path))
         if seg is None:
             continue
         full_seg = prefix_path + (seg[1:] if prefix_path else seg)
@@ -1581,13 +1724,37 @@ result = "-".join(str(ord(ch.upper()) - ord('A') + 1) for ch in code if ch.isalp
     supplied_result, supplied_status = _run_plan_path({
         "map": supplied_map, "start_pos": {"row": 4, "col": 0}, "hp": 5,
     })
-    expected_supplied_directions = ["right"] * 3 + ["up"] * 4 + ["right"] * 6
-    assert supplied_status == 200 and supplied_result["directions"] == expected_supplied_directions, \
-        f"supplied map must follow A5 -> D5 -> D1 -> J1 in one response: {supplied_result}"
-    supplied_visited = _walk((4, 0), supplied_result["directions"])
-    supplied_barriers = _build_grid(supplied_map)[3]
-    assert supplied_visited[-1] == (0, 9) and not (set(supplied_visited) & supplied_barriers), \
-        f"supplied-map route must end at J1 without crossing a wall: {supplied_visited}"
+    # Assert the SAFETY PROPERTIES, not one memorized array: the route must
+    # arrive, fit one reply, cross no wall, and leave the agent alive. Pinning
+    # the exact 13-move beeline would forbid the strictly better scoring
+    # route that now fits inside the budget.
+    supplied_directions = supplied_result["directions"]
+    assert supplied_status == 200 and supplied_directions, supplied_result
+    assert len(supplied_directions) <= MAX_ROUTE_DIRECTIONS, \
+        f"supplied-map route must fit one atomic reply: {len(supplied_directions)} moves"
+    supplied_visited = _walk((4, 0), supplied_directions)
+    g_supplied = _build_grid(supplied_map)
+    supplied_barriers, supplied_dangers = g_supplied[3], g_supplied[4]
+    supplied_doorc, supplied_keyp = g_supplied[9], g_supplied[8]
+    assert all(0 <= r < 10 and 0 <= c < 10 for r, c in supplied_visited), \
+        f"supplied-map route left the grid: {supplied_visited}"
+    assert not (set(supplied_visited) & supplied_barriers), \
+        f"supplied-map route crossed a wall: {supplied_visited}"
+    assert supplied_visited[-1] == (0, 9), \
+        f"supplied-map route must finish at the J1 treasure: {supplied_visited[-1]}"
+    assert (0, 9) not in supplied_visited[:-1], \
+        "the run ends on the treasure, so it must only be touched once, at the end"
+    supplied_keymap = {p: col for col, ps in supplied_keyp.items() for p in ps}
+    supplied_hp, supplied_held = 5, set()
+    for pos in supplied_visited:
+        if pos in supplied_keymap:
+            supplied_held.add(supplied_keymap[pos])
+        if pos in supplied_dangers:
+            supplied_hp -= 1
+        elif pos in supplied_doorc and supplied_doorc[pos] not in supplied_held:
+            supplied_hp -= LOCKED_DOOR_HP_DAMAGE
+    assert supplied_hp > 0, \
+        f"supplied-map route must leave the agent alive, HP would be {supplied_hp}"
 
     # Reject an overlong shortest fallback too. This corridor has only one
     # 53-step path, which cannot fit the game's 48-direction atomic reply.
@@ -1606,11 +1773,50 @@ result = "-".join(str(ord(ch.upper()) - ord('A') + 1) for ch in code if ch.isalp
     assert plan_path((0, 0), serpentine_map, hp_remaining=10, step_cost=1) == [], \
         "a 53-step direct fallback must not exceed the 48-direction atomic limit"
 
+    # DENSE MAP (>15 collectibles) - the branch none of the earlier checks
+    # covered. Above EXACT_SOLVE_LIMIT the planner drops to a heuristic, and
+    # that produced a 100+ move route which blew the atomic limit, so the
+    # whole route was discarded for a bare run to the treasure. It must now
+    # come back UNDER the limit and still collect real score.
+    dense_map = [["c7"] * 10 for _ in range(10)]
+    dense_map[0][0], dense_map[9][9] = "start", "treasure"
+    g_dense = _build_grid(dense_map)
+    dense_coins, dense_barriers, dense_treasure = g_dense[5], g_dense[3], g_dense[10]
+    assert len(dense_coins) > EXACT_SOLVE_LIMIT, \
+        "this regression only bites above EXACT_SOLVE_LIMIT"
+    dense_directions = plan_path((0, 0), dense_map, hp_remaining=5, step_cost=1)
+    dense_visited = _walk((0, 0), dense_directions)
+    assert dense_directions, "a dense map must still produce movement"
+    assert len(dense_directions) <= MAX_ROUTE_DIRECTIONS, \
+        f"dense route must fit one atomic reply, got {len(dense_directions)} moves"
+    assert dense_visited[-1] == dense_treasure, \
+        f"dense route must end at the treasure: {dense_visited[-1]}"
+    assert not (set(dense_visited) & dense_barriers), "dense route must never cross a wall"
+    dense_collected = len(set(dense_visited) & dense_coins)
+    assert dense_collected >= 25, \
+        f"dense route should still collect real score, only got {dense_collected} coins"
+
+    # Treasure-blocking: a mid-route waypoint must never be routed THROUGH
+    # the treasure, because stepping on it ends the run immediately.
+    block_map = [
+        ["start", "normal", "c7"],
+        ["wall", "treasure", "wall"],
+        ["normal", "normal", "normal"],
+    ]
+    g_block = _build_grid(block_map)
+    block_treasure = g_block[10]
+    assert not _is_reachable((0, 0), (2, 0), g_block[1], g_block[2], g_block[3],
+                             treasure=block_treasure), \
+        "a detour that can only pass through the treasure must NOT count as reachable"
+    assert _is_reachable((0, 0), block_treasure, g_block[1], g_block[2], g_block[3],
+                         treasure=block_treasure), \
+        "the treasure itself must still be reachable as the final goal"
+
     no_map_result, no_map_status = _run_plan_path({})
     assert no_map_status == 400 and no_map_result["directions"] == [] and no_map_result.get("error"), \
         "missing input must return an error with no movement, never the fatal down/right fallback"
 
-    print("OK: plan_path self-checks passed (15, including exact supplied map)")
+    print("OK: plan_path self-checks passed (17, including exact supplied map + dense map)")
 
     # ---- unified dispatch self-checks: "plain" testing shape ----
     resp_c = lambda_handler({"action": "execute_code", "code": "result = 6 * 7"}, None)
