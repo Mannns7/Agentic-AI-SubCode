@@ -403,6 +403,50 @@ DEFAULT_STEP_COST = 3
 # upgrade to paged/stateful movement when the game supports route chunks.
 MAX_ROUTE_DIRECTIONS = 48
 
+# ============================================================================
+# OPERATOR-DRAWN ROUTES  (these WIN over anything the planner would compute)
+# ============================================================================
+# Hand-drawn on the round-3 board, keyed by the tile the turn starts on.
+# BLUE  = first start  (A5) -> ends at A8
+# YELLOW = second start (A8) -> ends at the J1 treasure
+#
+# Followed EXACTLY: no planning, no reordering, and spike/door damage is NOT
+# a reason to reject. Only a wall or an off-grid step vetoes the route, since
+# the game refuses such a move and every later direction would then be applied
+# from the wrong tile.
+MANUAL_ROUTE_BLUE = (
+    ["right"] * 3      # A5 -> D5
+    + ["down"] * 3     # D5 -> D8  (D6 spikes: -1 HP, accepted)
+    + ["left"] * 3     # D8 -> A8
+)
+
+MANUAL_ROUTE_YELLOW = (
+    ["down"]           # A8 -> A9
+    + ["right"] * 3    # A9 -> D9
+    + ["down"]         # D9 -> D10
+    + ["right"] * 6    # D10 -> J10
+    + ["up"] * 2       # J10 -> J8
+    + ["left"] * 4     # J8 -> F8
+    + ["up"]           # F8 -> F7
+    + ["right"] * 4    # F7 -> J7
+    + ["up"] * 2       # J7 -> J5  (crosses the J6 grey door)
+    + ["left"] * 6     # J5 -> D5  (E5 spikes: -1 HP, accepted)
+    + ["up"] * 3       # D5 -> D2
+    + ["left"] * 3     # D2 -> A2
+    + ["up"]           # A2 -> A1  (grey key)
+    + ["right"] * 5    # A1 -> F1
+    + ["down"] * 2     # F1 -> F3  (yellow key)
+    + ["up"] * 2       # F3 -> F1
+    + ["right"] * 4    # F1 -> J1  (G1 coin, then the treasure)
+)
+
+MANUAL_ROUTES = {
+    (4, 0): MANUAL_ROUTE_BLUE,    # A5, first start
+    (7, 0): MANUAL_ROUTE_YELLOW,  # A8, second start
+}
+
+_MOVE_DELTAS = {"up": (-1, 0), "down": (1, 0), "left": (0, -1), "right": (0, 1)}
+
 # Tile types that must ALWAYS be visited when safely reachable, regardless
 # of whether the profit-maximizing selection thinks it's "worth" the
 # detour. Doors/keys are deliberately NOT forced — the score-vs-cost
@@ -951,6 +995,43 @@ def _path_to_directions(path):
     return directions
 
 
+def _manual_route(start, rows, cols, barriers, dangers, door_color, key_positions, hp_remaining):
+    """
+    Return the operator-drawn route for this start tile, or None.
+
+    Walls and grid bounds are the ONLY veto. HP cost is reported, never used
+    to reject - taking damage on this line is the operator's decision.
+    """
+    directions = MANUAL_ROUTES.get(tuple(start))
+    if not directions:
+        return None
+
+    key_at = {p: color for color, ps in key_positions.items() for p in ps}
+    r, c = start
+    held, damage = set(), 0
+    for i, d in enumerate(directions):
+        dr, dc = _MOVE_DELTAS[d]
+        r, c = r + dr, c + dc
+        if not (0 <= r < rows and 0 <= c < cols):
+            logger.error("drawn route step %d (%s) leaves the map at %s; ignoring it", i, d, (r, c))
+            return None
+        if (r, c) in barriers:
+            logger.error("drawn route step %d (%s) hits a wall at %s; ignoring it", i, d, (r, c))
+            return None
+        if (r, c) in key_at:
+            held.add(key_at[(r, c)])
+        if (r, c) in dangers:
+            damage += 1
+        elif (r, c) in door_color and door_color[(r, c)] not in held:
+            damage += LOCKED_DOOR_HP_DAMAGE
+    logger.warning("following the drawn route from %s: %d moves, %d HP of damage (HP now %s)",
+                   start, len(directions), damage, hp_remaining)
+    if damage >= hp_remaining:
+        logger.error("WARNING: the drawn route from %s costs %d HP but only %s remains - "
+                     "following it anyway as instructed", start, damage, hp_remaining)
+    return list(directions)
+
+
 def _plan_collect(current_pos, coins, challenges, treasure, rows, cols, barriers, dangers,
                    doors_all, door_color, held_keys, simulated_hp, step_cost, grid,
                    move_budget=MAX_ROUTE_DIRECTIONS):
@@ -1123,6 +1204,13 @@ def plan_path(start, game_map, hp_remaining=5, step_cost=DEFAULT_STEP_COST, visi
     # Calibrate the start against the real grid BEFORE planning anything -
     # a start inside a wall/off the map makes every subsequent move wrong.
     start = _resolve_start(start, rows, cols, barriers, grid)
+
+    # An operator-drawn route WINS. No planning, no reordering, no "safer"
+    # substitute - follow the line exactly as drawn.
+    drawn = _manual_route(start, rows, cols, barriers, dangers, door_color,
+                          key_positions, hp_remaining)
+    if drawn is not None:
+        return drawn
 
     if treasure is None:
         treasure = (rows - 1, cols - 1)
@@ -1705,6 +1793,11 @@ result = "-".join(str(ord(ch.upper()) - ord('A') + 1) for ch in code if ch.isalp
         f"route walked through a 'brick' wall: {v12}"
     assert v12[-1] == (2, 2), "must still reach the treasure around the wall"
 
+    # The next block tests the PLANNER, so the drawn routes are parked for it
+    # (A5 now has a drawn route, which correctly wins over any planning).
+    _saved_manual = dict(MANUAL_ROUTES)
+    MANUAL_ROUTES.clear()
+
     # Exact 10x10 layout from the supplied screenshot. The full score-
     # maximizing route is 91 moves in this implementation and was visibly
     # split into two game chat bubbles. The second fragment began with a
@@ -1811,6 +1904,46 @@ result = "-".join(str(ord(ch.upper()) - ord('A') + 1) for ch in code if ch.isalp
     assert _is_reachable((0, 0), block_treasure, g_block[1], g_block[2], g_block[3],
                          treasure=block_treasure), \
         "the treasure itself must still be reachable as the final goal"
+
+    MANUAL_ROUTES.update(_saved_manual)  # drawn routes back in charge
+
+    # OPERATOR-DRAWN ROUTES: the drawn line WINS - returned verbatim, never
+    # re-planned, never trimmed, and damage on it is not a rejection reason.
+    drawn_map = [
+        ["c42", "c5", "normal", "normal", "c1", "normal", "c7", "normal", "normal", "treasure"],
+        ["c18", "normal", "normal", "c17", "wall", "normal", "normal", "normal", "normal", "normal"],
+        ["normal", "normal", "normal", "normal", "wall", "c43", "normal", "normal", "normal", "normal"],
+        ["wall", "wall", "wall", "c17", "wall", "wall", "c8", "wall", "wall", "c33"],
+        ["start", "normal", "normal", "normal", "c8", "normal", "normal", "normal", "normal", "normal"],
+        ["wall", "wall", "wall", "c8", "wall", "wall", "wall", "wall", "wall", "c32"],
+        ["c8", "normal", "normal", "normal", "wall", "c7", "c7", "c7", "c7", "c1"],
+        ["c17", "normal", "normal", "c18", "wall", "c2", "c7", "c7", "c7", "c7"],
+        ["normal", "normal", "normal", "normal", "wall", "wall", "wall", "wall", "wall", "normal"],
+        ["c8", "normal", "normal", "c5", "c17", "c7", "c7", "c7", "c7", "c7"],
+    ]
+    drawn_barriers = _build_grid(drawn_map)[3]
+
+    blue = plan_path((4, 0), drawn_map, hp_remaining=5)
+    assert blue == MANUAL_ROUTE_BLUE, f"the BLUE drawn route must be returned verbatim: {blue}"
+    blue_visited = _walk((4, 0), blue)
+    assert not (set(blue_visited) & drawn_barriers), "BLUE route must not cross a wall"
+    assert blue_visited[-1] == (7, 0), f"BLUE route must end at A8: {blue_visited[-1]}"
+
+    yellow = plan_path((7, 0), drawn_map, hp_remaining=5)
+    assert yellow == MANUAL_ROUTE_YELLOW, f"the YELLOW drawn route must be returned verbatim: {yellow}"
+    yellow_visited = _walk((7, 0), yellow)
+    assert not (set(yellow_visited) & drawn_barriers), "YELLOW route must not cross a wall"
+    assert yellow_visited[-1] == (0, 9), f"YELLOW route must end at J1: {yellow_visited[-1]}"
+    assert len(yellow) > MAX_ROUTE_DIRECTIONS, \
+        "a drawn route must NOT be trimmed to the planner budget"
+
+    # The one veto: a drawn step into a wall desyncs every later move.
+    MANUAL_ROUTES[(4, 0)] = ["down"]  # A5 -> A6 is a wall
+    assert plan_path((4, 0), drawn_map, hp_remaining=5) != ["down"], \
+        "a drawn route that walks into a wall must fall through to the planner"
+    MANUAL_ROUTES[(4, 0)] = MANUAL_ROUTE_BLUE
+
+    print("OK: operator-drawn route self-checks passed (10)")
 
     no_map_result, no_map_status = _run_plan_path({})
     assert no_map_status == 400 and no_map_result["directions"] == [] and no_map_result.get("error"), \
