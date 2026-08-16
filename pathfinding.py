@@ -278,10 +278,73 @@ def _pick(payload: Mapping[str, Any], aliases: Sequence[str], required: bool = F
     return None
 
 
-def _unwrap_event(event: Any) -> Dict[str, Any]:
-    """Accept direct Lambda payloads and API Gateway JSON bodies."""
+def _detect_schema_type(event: Any) -> str:
+    """Detect the invocation envelope used by Bedrock or a local test."""
+    if not isinstance(event, Mapping):
+        return "plain"
+    if "function" in event and "parameters" in event:
+        return "function"
+    if "apiPath" in event and "httpMethod" in event:
+        return "openapi"
+    return "plain"
+
+
+def _coerce_param_value(value: Any, param_type: Optional[str] = None) -> Any:
+    """Decode Bedrock's JSON-encoded array/object parameter values."""
+    if not isinstance(value, str):
+        return value
+
+    text = value.strip()
+    if text.startswith("[") or text.startswith("{"):
+        try:
+            return json.loads(text)
+        except (TypeError, ValueError):
+            return value
+
+    if param_type in ("integer", "number"):
+        try:
+            return int(text) if param_type == "integer" else float(text)
+        except (TypeError, ValueError):
+            return value
+
+    return value
+
+
+def _params_to_payload(parameters: Any) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {}
+
+    if isinstance(parameters, Mapping):
+        return {
+            str(name): _coerce_param_value(value)
+            for name, value in parameters.items()
+        }
+
+    if isinstance(parameters, Sequence) and not isinstance(parameters, (str, bytes)):
+        for parameter in parameters:
+            if isinstance(parameter, Mapping):
+                name = parameter.get("name")
+                if name:
+                    payload[str(name)] = _coerce_param_value(
+                        parameter.get("value"), parameter.get("type")
+                    )
+
+    return payload
+
+
+def _extract_request(event: Any) -> Tuple[Dict[str, Any], str]:
+    """Return (payload, schema_type) for Bedrock function/OpenAPI/plain calls."""
+    schema_type = _detect_schema_type(event)
+
     if not isinstance(event, Mapping):
         raise PathfindingError("Lambda event must be a JSON object", 400)
+
+    if schema_type == "function":
+        return _params_to_payload(event.get("parameters")), schema_type
+
+    if schema_type == "openapi":
+        content = (event.get("requestBody") or {}).get("content") or {}
+        properties = (content.get("application/json") or {}).get("properties", [])
+        return _params_to_payload(properties), schema_type
 
     payload: Dict[str, Any] = dict(event)
     body = payload.get("body")
@@ -296,13 +359,7 @@ def _unwrap_event(event: Any) -> Dict[str, Any]:
         else:
             raise PathfindingError("event.body must be a JSON object", 400)
 
-    parameters = payload.get("parameters")
-    if isinstance(parameters, Sequence) and not isinstance(parameters, (str, bytes)):
-        for parameter in parameters:
-            if isinstance(parameter, Mapping) and "name" in parameter and "value" in parameter:
-                payload.setdefault(str(parameter["name"]), parameter["value"])
-
-    return payload
+    return payload, schema_type
 
 
 def _in_bounds(grid: Sequence[Sequence[str]], position: Position) -> bool:
@@ -533,21 +590,65 @@ def plan_path(payload: Mapping[str, Any]) -> List[str]:
     return directions
 
 
-def _response(status_code: int, body: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        "statusCode": status_code,
-        "body": json.dumps(body, separators=(",", ":")),
-    }
+def _wrap_response(
+    event: Any,
+    schema_type: str,
+    result: Dict[str, Any],
+    status_code: int = 200,
+) -> Dict[str, Any]:
+    """Reply in the same envelope Bedrock used to invoke this Lambda."""
+    body_json = json.dumps(result, separators=(",", ":"))
+    event_map: Mapping[str, Any] = event if isinstance(event, Mapping) else {}
+
+    if schema_type == "function":
+        return {
+            "messageVersion": "1.0",
+            "response": {
+                "actionGroup": event_map.get("actionGroup", "PathfindingLambdaTarget"),
+                "function": event_map.get("function", "plan_path"),
+                "functionResponse": {"responseBody": {"TEXT": {"body": body_json}}},
+            },
+            "sessionAttributes": event_map.get("sessionAttributes", {}),
+            "promptSessionAttributes": event_map.get("promptSessionAttributes", {}),
+        }
+
+    if schema_type == "openapi":
+        return {
+            "messageVersion": "1.0",
+            "response": {
+                "actionGroup": event_map.get("actionGroup", "PathfindingLambdaTarget"),
+                "apiPath": event_map.get("apiPath", "/plan_path"),
+                "httpMethod": event_map.get("httpMethod", "POST"),
+                "httpStatusCode": status_code,
+                "responseBody": {"application/json": {"body": body_json}},
+            },
+            "sessionAttributes": event_map.get("sessionAttributes", {}),
+            "promptSessionAttributes": event_map.get("promptSessionAttributes", {}),
+        }
+
+    return {"statusCode": status_code, "body": body_json}
 
 
 def lambda_handler(event: Any, context: Any) -> Dict[str, Any]:
     """AWS Lambda entry point. Never emits guessed or arbitrary fallback moves."""
     del context
+    schema_type = _detect_schema_type(event)
+
     try:
-        payload = _unwrap_event(event)
+        payload, schema_type = _extract_request(event)
         directions = plan_path(payload)
-        return _response(200, {"directions": directions})
+        return _wrap_response(event, schema_type, {"directions": directions})
     except PathfindingError as exc:
-        return _response(exc.status_code, {"directions": [], "error": str(exc)})
+        return _wrap_response(
+            event,
+            schema_type,
+            {"directions": [], "error": str(exc)},
+            exc.status_code,
+        )
     except Exception as exc:  # Safe failure: report the issue but never invent movement.
-        return _response(500, {"directions": [], "error": f"pathfinding failed: {exc}"})
+        return _wrap_response(
+            event,
+            schema_type,
+            {"directions": [], "error": f"pathfinding failed: {exc}"},
+            500,
+        )

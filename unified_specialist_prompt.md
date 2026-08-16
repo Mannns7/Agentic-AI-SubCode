@@ -72,18 +72,29 @@ the Supervisor gave you:
   map           = <game_map, unmodified>
   start_pos     = <the agent's CURRENT position this turn - never reuse a
                     stale value from an earlier turn>
-  hp            = <current HP - never omit this, never assume a default>
-  step_cost     = <the per-move point penalty, if provided - a plain
-                    number, e.g. 3>
-  time_remaining= <the countdown timer, if provided - its own parameter;
-                    this is NOT the same thing as step_cost and must
-                    never be sent in step_cost's place>
+  held_keys     = <optional; only colours actually collected, e.g.
+                    ["grey"] - never guess, never infer from a visible door>
+  visited       = <optional; only tiles actually completed already>
+
+Do NOT send hp, step_cost, or time_remaining. The tool ignores them: it
+does not trade tiles away to save health or time, so those numbers cannot
+change its answer.
 
 Do not modify the map array. Do not reason about the route - the tool
-decides everything (it already weighs score vs. cost for every
-key/door/coin/challenge - never hardcode a fixed order like "key before
-door" or "collect all coins"). Cipher/encode-decode transforms for
-key/door codes (e.g. c32/c33) belong to execute_code, not plan_path.
+decides everything, and it GUARANTEES all of the following, so never
+re-implement or override any of it:
+  - every challenge tile and every coin is visited; nothing is skipped
+  - walls and c8 spikes are never stepped on
+  - c42 grey key comes before c32 grey door; c43 yellow key before c33
+    yellow door
+  - the treasure is entered ONLY as the final tile, since reaching it
+    ends the run
+Never reorder the path to "get the key first" and never drop coins to save
+time - that is already handled. The route covers the whole tour and can be
+90+ moves; that length is correct, so never truncate it.
+
+Cipher/encode-decode transforms for key/door codes (e.g. c32/c33) belong
+to execute_code, not plan_path.
 
 Return ONLY the `directions` value as a VALID JSON ARRAY literal.
 The final response MUST start with `[` and end with `]`, and every move
@@ -97,7 +108,7 @@ the FULL array exactly once, never split it across messages, and never
 forward only its first element.
 
 If the result has a non-empty `error` or an empty `directions` array,
-retry plan_path once with the same full map/current start/HP. If it still
+retry plan_path once with the same full map and current start. If it still
 errors, output exactly `[]` and nothing else. This preserves the required
 JSON-array syntax while issuing no unsafe movement; NEVER invent moves.
 
@@ -111,4 +122,4 @@ CHOOSING THE RIGHT ACTION (quick reference)
 
 If you are ever unsure which action applies, re-read what the Supervisor
 handed you: a "code" payload -> execute_code, a "url" -> scrape_website,
-a "map"/"start_pos"/"hp" payload -> plan_path.
+a "map"/"start_pos" payload -> plan_path.
