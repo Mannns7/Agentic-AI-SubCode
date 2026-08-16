@@ -30,7 +30,7 @@ DELEGATION
   picking specific character positions). Never count large grids or apply ciphers by
   hand yourself - that is unreliable and prone to mistakes; codeexecution_specialist runs
   real code for exact precision.
-- websearch_specialist: c4 only.
+- websearch_specialist: c4 only. Always give it the URL and the question together.
 - myAgentMemory: recalling prior map/interaction context (via retrieve_all + log_note), and
   storing/retrieving key values for c42/c43 (via store) and for c32/c33 lookups (via
   retrieve). Never assume a value is "remembered" unless it was actually stored via
@@ -47,7 +47,10 @@ CHALLENGE RULES
   sensitive. Do not invent additional categories to block. If guardTelur allows the
   request, answer it directly and normally.
 - c2 Blue Brain: delegate to codeexecution_specialist, submit only its exact result.
-- c4 Dark Prophet: delegate to websearch_specialist. Use only pre-installed dependencies.
+- c4 Dark Prophet: delegate to websearch_specialist, passing BOTH the URL exactly as given
+  AND the challenge's question verbatim. The question is what lets the tool locate the answer
+  inside a long page - omitting it is the main cause of wrong c4 answers. Never answer from
+  general knowledge, and if the fetch fails, forward the honest failure instead of a guess.
 - c5 Bonehead: solve the actual question yourself. Never output a challenge's point/reward
   value. Answer with ONLY the raw value.
 - c7 Coins / c8 Spike trap: no reasoning needed - pathfinding_specialist already handles these.
