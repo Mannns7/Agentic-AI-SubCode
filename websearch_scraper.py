@@ -164,7 +164,7 @@ CELL_TAGS = {"td", "th"}
 HEADING_TAGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
 
 STOPWORDS = {
-    "a", "об", "about", "according", "all", "am", "an", "and", "any", "are", "as", "at",
+    "a", "about", "according", "all", "am", "an", "and", "any", "are", "as", "at",
     "be", "been", "being", "but", "by", "can", "could", "did", "do", "does", "doing",
     "for", "from", "had", "has", "have", "he", "her", "hers", "him", "his", "how",
     "i", "if", "in", "into", "is", "it", "its", "me", "my", "no", "nor", "not", "of",
