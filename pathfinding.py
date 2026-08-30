@@ -8,9 +8,16 @@ from collections import deque
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-DANGER_COST = 1000
-DOOR_COST_LOCKED = 5000
 LOCKED_DOOR_HP_DAMAGE = 5  # guide: crossing a locked door does -5 real damage
+
+# ponytail: tie-break only. Must stay far smaller than 1 (the cost of a
+# whole extra step), so it NEVER makes the search prefer a longer route -
+# it only nudges the choice between two routes that are EXACTLY the same
+# length toward the one that avoids the spike. This is what lets the
+# agent cross a spike for real when doing so is genuinely the shorter way
+# to a coin/quest tile, instead of taking a long detour purely to dodge
+# it (the old behavior: any hazard-free path won outright, however long).
+SPIKE_TIEBREAK = 1e-3
 
 # Base scores for tile types that don't follow the generic "cN = 400" rule.
 TILE_SCORES = {"c1": 400, "c3": 550, "c4": 800, "c5": 250, "c18": 500, "c7": 250}
@@ -85,9 +92,9 @@ def _tile_score(cell_lower, pos=None, door_map=None, held_keys=None):
     scored the full +1000 reward regardless of whether the matching key
     was held, which made the route optimizer treat every locked door as a
     free +1000 detour. In reality a locked door gives NO reward, only the
-    -5 HP hazard cost (modeled separately in _hp_cost_of_path) - the
-    optimizer chasing a reward that doesn't exist is exactly what produces
-    a route that walks toward a door, gets nothing, and backtracks.
+    -5 HP hazard cost (modeled in _weighted_bfs) - the optimizer chasing a
+    reward that doesn't exist is exactly what produces a route that walks
+    toward a door, gets nothing, and backtracks.
     """
     if pos is not None and door_map is not None and pos in door_map:
         held_keys = held_keys or frozenset()
@@ -281,59 +288,61 @@ def _locked_doors(door_map, held_keys):
 
 
 def _weighted_bfs(start, goal, rows, cols, barriers, dangers, door_map, held_keys):
+    """
+    Dijkstra where every move costs exactly 1 step, PLUS a real HP cost for
+    landing on a spike (1) or a still-locked door (5). This is a genuine
+    cost comparison, not a hazard-avoidance search: a route that crosses one
+    spike to save several steps now correctly beats a longer detour around
+    it, and vice versa when the detour is actually shorter or the same
+    length. SPIKE_TIEBREAK only breaks a true tie between equal-length
+    routes; it never overrides a real distance difference.
+    """
     if start == goal:
         return [start], 0
     locked = _locked_doors(door_map, held_keys)
-    pq = [(0, start[0], start[1], [start])]
-    best_cost = {start: 0}
+    pq = [(0.0, start[0], start[1], [start], 0)]
+    best_cost = {start: 0.0}
     while pq:
-        cost, r, c, path = heapq.heappop(pq)
+        cost, r, c, path, hp_cost = heapq.heappop(pq)
         if (r, c) == goal:
-            return path, cost
+            return path, hp_cost
         if cost > best_cost.get((r, c), float('inf')):
             continue
         for dr, dc, _ in DIRECTIONS:
             nr, nc = r + dr, c + dc
             if not (0 <= nr < rows and 0 <= nc < cols) or (nr, nc) in barriers:
                 continue
-            move_cost = DOOR_COST_LOCKED if (nr, nc) in locked else (DANGER_COST if (nr, nc) in dangers else 1)
-            new_cost = cost + move_cost
+            if (nr, nc) in locked:
+                step_hp, tiebreak = LOCKED_DOOR_HP_DAMAGE, LOCKED_DOOR_HP_DAMAGE * SPIKE_TIEBREAK
+            elif (nr, nc) in dangers:
+                step_hp, tiebreak = 1, SPIKE_TIEBREAK
+            else:
+                step_hp, tiebreak = 0, 0
+            new_cost = cost + 1 + tiebreak
             if new_cost < best_cost.get((nr, nc), float('inf')):
                 best_cost[(nr, nc)] = new_cost
-                heapq.heappush(pq, (new_cost, nr, nc, path + [(nr, nc)]))
-    return None, float('inf')
-
-
-def _hp_cost_of_path(path, dangers, door_map, held_keys):
-    locked = _locked_doors(door_map, held_keys)
-    cost = 0
-    for p in path[1:]:
-        if p in dangers:
-            cost += 1
-        elif p in locked:
-            cost += LOCKED_DOOR_HP_DAMAGE
-    return cost
+                heapq.heappush(pq, (new_cost, nr, nc, path + [(nr, nc)], hp_cost + step_hp))
+    return None, None
 
 
 def _find_path(start, goal, rows, cols, barriers, dangers, door_map, held_keys, treasure=None):
     """
-    Two-phase pathfinding, generalized to any number of key/door color
-    pairs. Stepping onto the treasure tile ends the run immediately, so
-    it's blocked as an incidental waypoint unless it IS the goal.
+    Weighted pathfinding, generalized to any number of key/door color
+    pairs. Every candidate route is judged on real cost (steps + HP), so
+    crossing a spike/locked door is taken exactly when it is genuinely
+    the cheaper way through - never avoided purely because an alternative
+    exists, and never taken just because it looks shorter on the grid.
+    Stepping onto the treasure tile ends the run immediately, so it's
+    blocked as an incidental waypoint unless it IS the goal.
     """
     effective_barriers = barriers
     if treasure is not None and treasure != goal:
         effective_barriers = barriers | {treasure}
 
-    locked = _locked_doors(door_map, held_keys)
-    hazards = set(dangers) | locked
-    safe_path = _bfs_simple(start, goal, rows, cols, effective_barriers | hazards)
-    if safe_path is not None:
-        return safe_path, 0
-    path, _ = _weighted_bfs(start, goal, rows, cols, effective_barriers, dangers, door_map, held_keys)
+    path, hp_cost = _weighted_bfs(start, goal, rows, cols, effective_barriers, dangers, door_map, held_keys)
     if path is None:
         return None, None
-    return path, _hp_cost_of_path(path, dangers, door_map, held_keys)
+    return path, hp_cost
 
 
 def _is_reachable(start, goal, rows, cols, barriers, treasure=None):
@@ -1433,6 +1442,55 @@ if __name__ == "__main__":
     assert plan_path((4, 0), drawn_map, hp_remaining=5) != ["down"], \
         "a drawn route that walks into a wall must fall through to the planner"
     MANUAL_ROUTES.clear()  # back to the round-4 default: planner in charge
+
+    # SPIKE COST vs AVOIDANCE: crossing a spike must be a real cost
+    # comparison, not "avoid it whenever any alternative exists". The old
+    # two-phase search picked ANY hazard-free path first, however long,
+    # which produced long detours around a spike that would only have cost
+    # 1 HP - this is the exact zigzag reported from live play.
+    def _visited(start, directions):
+        r, c = start
+        out = [start]
+        for d in directions:
+            dr, dc = _MOVE_DELTAS[d]
+            r, c = r + dr, c + dc
+            out.append((r, c))
+        return out
+
+    # (a) the spike is the ONLY way through -> must cross it.
+    only_way_map = [["start", "c8", "treasure"], ["wall", "wall", "wall"]]
+    d9 = plan_path((0, 0), only_way_map, hp_remaining=10)
+    assert (0, 1) in _visited((0, 0), d9), "must cross the spike when it's the only route"
+
+    # (b) a genuinely LONGER detour exists alongside a spike shortcut ->
+    # must take the shortcut (1 HP is cheaper than the extra steps). The
+    # spike route is 2 moves; the clean detour around it is 6.
+    long_detour_map = [
+        ["start", "c8", "treasure"],
+        ["normal", "normal", "normal"],
+        ["normal", "normal", "normal"],
+    ]
+    d10 = plan_path((0, 0), long_detour_map, hp_remaining=10)
+    v10 = _visited((0, 0), d10)
+    assert (0, 1) in v10, "a spike shortcut cheaper than the detour must be taken"
+    assert len(d10) == 2, f"the shortcut route must be the 2-move spike crossing, got {len(d10)} moves"
+
+    # (c) an EQUALLY long clean path exists alongside the spike -> a true
+    # tie must break toward the clean route (SPIKE_TIEBREAK, not chance).
+    tie_map = [
+        ["start", "c8", "normal"],
+        ["normal", "wall", "normal"],
+        ["normal", "normal", "treasure"],
+    ]
+    d11 = plan_path((0, 0), tie_map, hp_remaining=10)
+    assert (0, 1) not in _visited((0, 0), d11), \
+        "a same-length clean route must win the tie over the spike route"
+
+    # (d) crossing the spike would be fatal and it's the only way through
+    # -> no survivable route exists, so the answer must be [], never a
+    # guessed/forced move.
+    d12 = plan_path((0, 0), only_way_map, hp_remaining=1)
+    assert d12 == [], "a fatal spike with no alternative must yield no movement, not a forced crossing"
 
     # A malformed/empty Bedrock call must return an explicit error and NO
     # movement. It must never resurrect the fatal ["down", "right"]
