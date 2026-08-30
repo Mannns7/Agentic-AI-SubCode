@@ -31,46 +31,18 @@ MAX_ROUTE_DIRECTIONS = 48
 # ============================================================================
 # OPERATOR-DRAWN ROUTES  (these WIN over anything the planner would compute)
 # ============================================================================
-# Hand-drawn on the round-3 board and keyed by the tile the turn starts on.
-# BLUE  = first start  (A5) -> ends at A8
-# YELLOW = second start (A8) -> ends at the J1 treasure
+# Map a start tile to a hand-drawn move list, e.g.
+#     MANUAL_ROUTES = {(4, 0): ["right", "right", "up"]}
+# When the turn starts on that tile the list is returned EXACTLY: the planner
+# is not consulted, the route is not re-ordered or trimmed, and spike/door
+# damage on it is NOT a reason to reject it - that damage is a deliberate
+# trade. The only veto is a step that leaves the grid or enters a wall, since
+# the game refuses such a move and every later direction would then be
+# applied from the wrong tile.
 #
-# These are followed EXACTLY. The planner is not consulted, the route is not
-# re-ordered, and spike/door damage on the way is NOT a reason to reject it -
-# the damage is a deliberate trade the operator chose. The only thing checked
-# is that a step does not leave the grid or enter a wall, because the game
-# refuses such a move and every direction after it would be applied from the
-# wrong tile.
-MANUAL_ROUTE_BLUE = (
-    ["right"] * 3      # A5 -> D5
-    + ["down"] * 3     # D5 -> D8  (D6 spikes: -1 HP, accepted)
-    + ["left"] * 3     # D8 -> A8
-)
-
-MANUAL_ROUTE_YELLOW = (
-    ["down"]           # A8 -> A9
-    + ["right"] * 3    # A9 -> D9
-    + ["down"]         # D9 -> D10
-    + ["right"] * 6    # D10 -> J10
-    + ["up"] * 2       # J10 -> J8
-    + ["left"] * 4     # J8 -> F8
-    + ["up"]           # F8 -> F7
-    + ["right"] * 4    # F7 -> J7
-    + ["up"] * 2       # J7 -> J5  (crosses the J6 grey door)
-    + ["left"] * 6     # J5 -> D5  (E5 spikes: -1 HP, accepted)
-    + ["up"] * 3       # D5 -> D2
-    + ["left"] * 3     # D2 -> A2
-    + ["up"]           # A2 -> A1  (grey key)
-    + ["right"] * 5    # A1 -> F1
-    + ["down"] * 2     # F1 -> F3  (yellow key)
-    + ["up"] * 2       # F3 -> F1
-    + ["right"] * 4    # F1 -> J1  (G1 coin, then the treasure)
-)
-
-MANUAL_ROUTES = {
-    (4, 0): MANUAL_ROUTE_BLUE,    # A5, first start
-    (7, 0): MANUAL_ROUTE_YELLOW,  # A8, second start
-}
+# EMPTY for round 4: the round-3 lines were drawn for the old board and would
+# be wrong here, so the planner is in charge until new lines are drawn.
+MANUAL_ROUTES = {}
 
 # Tile types that must ALWAYS be visited when safely reachable, regardless
 # of whether the profit-maximizing selection thinks it's "worth" the
@@ -99,6 +71,10 @@ def _key_code_for_door(door_code):
     per the game's Red/Green/Grey/Yellow/etc. key-door color convention)."""
     m = _DOOR_RE.match(door_code)
     return f"c4{m.group(1)}" if m else None
+
+
+def _is_door_type(cell_lower):
+    return bool(_DOOR_RE.match(cell_lower))
 
 
 def _tile_score(cell_lower, pos=None, door_map=None, held_keys=None):
@@ -597,7 +573,16 @@ def _plan_collect(current_pos, coins, challenges, treasure, rows, cols, barriers
         extra = CHALLENGE_HP_COST if pos in challenges else 0
         if hp_cost + extra >= simulated_hp:
             continue
-        if grid.get(pos, "") in FORCE_COLLECT_TYPES:
+        cell = grid.get(pos, "")
+        # Doors are forced too (not just c4/c18) ONLY once their matching key
+        # is actually held: an unlocked door must always be taken (never
+        # skipped for a cheaper coin detour), but a STILL locked door stays
+        # optional. A locked door scores 0, so the normal profit filter
+        # already stops the planner chasing it for nothing - forcing it
+        # unconditionally would make the agent eat 5 HP crossing a locked
+        # door even when a free bypass exists.
+        is_open_door = _is_door_type(cell) and _key_code_for_door(cell) in held_keys
+        if cell in FORCE_COLLECT_TYPES or is_open_door:
             forced_targets.append(pos)
         else:
             safe_targets.append(pos)
@@ -1409,6 +1394,19 @@ if __name__ == "__main__":
     g_drawn = _build_grid(drawn_map)
     drawn_barriers = g_drawn[3]
 
+    # The round-3 hand-drawn lines, kept HERE (not in module config) purely to
+    # prove the drawn-route MECHANISM still works. Round 4 ships with
+    # MANUAL_ROUTES empty, so the planner runs unless lines are drawn again.
+    MANUAL_ROUTE_BLUE = ["right"] * 3 + ["down"] * 3 + ["left"] * 3
+    MANUAL_ROUTE_YELLOW = (
+        ["down"] + ["right"] * 3 + ["down"] + ["right"] * 6 + ["up"] * 2
+        + ["left"] * 4 + ["up"] + ["right"] * 4 + ["up"] * 2 + ["left"] * 6
+        + ["up"] * 3 + ["left"] * 3 + ["up"] + ["right"] * 5 + ["down"] * 2
+        + ["up"] * 2 + ["right"] * 4
+    )
+    MANUAL_ROUTES[(4, 0)] = MANUAL_ROUTE_BLUE
+    MANUAL_ROUTES[(7, 0)] = MANUAL_ROUTE_YELLOW
+
     blue = plan_path((4, 0), drawn_map, hp_remaining=5)
     assert blue == MANUAL_ROUTE_BLUE, f"the BLUE drawn route must be returned verbatim: {blue}"
     blue_visited = _walk((4, 0), blue)
@@ -1434,7 +1432,7 @@ if __name__ == "__main__":
     MANUAL_ROUTES[(4, 0)] = ["down"]  # A5 -> A6 is a wall
     assert plan_path((4, 0), drawn_map, hp_remaining=5) != ["down"], \
         "a drawn route that walks into a wall must fall through to the planner"
-    MANUAL_ROUTES[(4, 0)] = MANUAL_ROUTE_BLUE
+    MANUAL_ROUTES.clear()  # back to the round-4 default: planner in charge
 
     # A malformed/empty Bedrock call must return an explicit error and NO
     # movement. It must never resurrect the fatal ["down", "right"]

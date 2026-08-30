@@ -406,44 +406,18 @@ MAX_ROUTE_DIRECTIONS = 48
 # ============================================================================
 # OPERATOR-DRAWN ROUTES  (these WIN over anything the planner would compute)
 # ============================================================================
-# Hand-drawn on the round-3 board, keyed by the tile the turn starts on.
-# BLUE  = first start  (A5) -> ends at A8
-# YELLOW = second start (A8) -> ends at the J1 treasure
+# Map a start tile to a hand-drawn move list, e.g.
+#     MANUAL_ROUTES = {(4, 0): ["right", "right", "up"]}
+# When the turn starts on that tile the list is returned EXACTLY: the planner
+# is not consulted, the route is not re-ordered or trimmed, and spike/door
+# damage on it is NOT a reason to reject it - that damage is a deliberate
+# trade. The only veto is a step that leaves the grid or enters a wall, since
+# the game refuses such a move and every later direction would then be
+# applied from the wrong tile.
 #
-# Followed EXACTLY: no planning, no reordering, and spike/door damage is NOT
-# a reason to reject. Only a wall or an off-grid step vetoes the route, since
-# the game refuses such a move and every later direction would then be applied
-# from the wrong tile.
-MANUAL_ROUTE_BLUE = (
-    ["right"] * 3      # A5 -> D5
-    + ["down"] * 3     # D5 -> D8  (D6 spikes: -1 HP, accepted)
-    + ["left"] * 3     # D8 -> A8
-)
-
-MANUAL_ROUTE_YELLOW = (
-    ["down"]           # A8 -> A9
-    + ["right"] * 3    # A9 -> D9
-    + ["down"]         # D9 -> D10
-    + ["right"] * 6    # D10 -> J10
-    + ["up"] * 2       # J10 -> J8
-    + ["left"] * 4     # J8 -> F8
-    + ["up"]           # F8 -> F7
-    + ["right"] * 4    # F7 -> J7
-    + ["up"] * 2       # J7 -> J5  (crosses the J6 grey door)
-    + ["left"] * 6     # J5 -> D5  (E5 spikes: -1 HP, accepted)
-    + ["up"] * 3       # D5 -> D2
-    + ["left"] * 3     # D2 -> A2
-    + ["up"]           # A2 -> A1  (grey key)
-    + ["right"] * 5    # A1 -> F1
-    + ["down"] * 2     # F1 -> F3  (yellow key)
-    + ["up"] * 2       # F3 -> F1
-    + ["right"] * 4    # F1 -> J1  (G1 coin, then the treasure)
-)
-
-MANUAL_ROUTES = {
-    (4, 0): MANUAL_ROUTE_BLUE,    # A5, first start
-    (7, 0): MANUAL_ROUTE_YELLOW,  # A8, second start
-}
+# EMPTY for round 4: the round-3 lines were drawn for the old board and would
+# be wrong here, so the planner is in charge until new lines are drawn.
+MANUAL_ROUTES = {}
 
 _MOVE_DELTAS = {"up": (-1, 0), "down": (1, 0), "left": (0, -1), "right": (0, 1)}
 
@@ -1923,6 +1897,19 @@ result = "-".join(str(ord(ch.upper()) - ord('A') + 1) for ch in code if ch.isalp
     ]
     drawn_barriers = _build_grid(drawn_map)[3]
 
+    # The round-3 hand-drawn lines, kept HERE (not in module config) purely to
+    # prove the drawn-route MECHANISM still works. Round 4 ships with
+    # MANUAL_ROUTES empty, so the planner runs unless lines are drawn again.
+    MANUAL_ROUTE_BLUE = ["right"] * 3 + ["down"] * 3 + ["left"] * 3
+    MANUAL_ROUTE_YELLOW = (
+        ["down"] + ["right"] * 3 + ["down"] + ["right"] * 6 + ["up"] * 2
+        + ["left"] * 4 + ["up"] + ["right"] * 4 + ["up"] * 2 + ["left"] * 6
+        + ["up"] * 3 + ["left"] * 3 + ["up"] + ["right"] * 5 + ["down"] * 2
+        + ["up"] * 2 + ["right"] * 4
+    )
+    MANUAL_ROUTES[(4, 0)] = MANUAL_ROUTE_BLUE
+    MANUAL_ROUTES[(7, 0)] = MANUAL_ROUTE_YELLOW
+
     blue = plan_path((4, 0), drawn_map, hp_remaining=5)
     assert blue == MANUAL_ROUTE_BLUE, f"the BLUE drawn route must be returned verbatim: {blue}"
     blue_visited = _walk((4, 0), blue)
@@ -1941,7 +1928,7 @@ result = "-".join(str(ord(ch.upper()) - ord('A') + 1) for ch in code if ch.isalp
     MANUAL_ROUTES[(4, 0)] = ["down"]  # A5 -> A6 is a wall
     assert plan_path((4, 0), drawn_map, hp_remaining=5) != ["down"], \
         "a drawn route that walks into a wall must fall through to the planner"
-    MANUAL_ROUTES[(4, 0)] = MANUAL_ROUTE_BLUE
+    MANUAL_ROUTES.clear()  # back to the round-4 default: planner in charge
 
     print("OK: operator-drawn route self-checks passed (10)")
 
